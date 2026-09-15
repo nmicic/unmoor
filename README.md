@@ -135,7 +135,7 @@ SSH credentials authenticate a public-record exchange; the terminal that
 follows runs over UDP:
 
 ```sh
-UNMOOR_PACE_BPS=400000 bin/client.sh --remote ./unmoor/unmoor user@server
+bin/client.sh --remote ./unmoor/unmoor user@server
 ```
 
 `--remote` is the path to the `unmoor` executable **on the server**, which you
@@ -148,6 +148,9 @@ tests are deliberately not like this; [`HOWTO.md`](HOWTO.md) says how they
 differ.
 
 Leave the session with Enter then `~.`. `Ctrl-] s` prints local sync status.
+The wrapper currently starts both endpoints with a conservative 2 MB/s source
+pace. Override it with `UNMOOR_PACE_BPS=N`; `0` disables pacing. This fixed
+rate is an interim safeguard, not adaptive congestion control.
 
 Single files move over the same bootstrap, with no interactive session first:
 

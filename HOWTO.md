@@ -69,7 +69,7 @@ producing something weaker.
 ## 2. Start a session
 
 ```sh
-UNMOOR_PACE_BPS=400000 bin/client.sh --remote ./unmoor/unmoor user@server
+bin/client.sh --remote ./unmoor/unmoor user@server
 ```
 
 That is the whole normal workflow. `bin/client.sh` uses your existing SSH
@@ -89,10 +89,11 @@ Locally, `bin/client.sh` always runs the `unmoor` next to this checkout, never
 one that happens to be on your `PATH`. Add `--local PATH` when you deliberately
 want to test a different local binary.
 
-`UNMOOR_PACE_BPS` is a read pacer in bytes per second. It limits how fast
-Unmoor reads from the local source, so a burst never exceeds what the
-bottleneck queue can absorb. Set it to something near your real uplink. Zero
-turns it off.
+`bin/client.sh` defaults `UNMOOR_PACE_BPS` to 2000000 (2 MB/s) and forwards
+it to the remote listener. It is a read pacer in bytes per second and limits
+how fast Unmoor reads from each local source. Set it explicitly to another
+rate when needed; zero turns pacing off. This fixed rate is an interim
+safeguard, not adaptive congestion control.
 
 The client must be able to send UDP to the ephemeral port printed by the
 remote listener, and replies must be able to return. SSH reachability by
@@ -342,8 +343,10 @@ also deliberately consumed unless escaped.
 These are Unmoor's own defaults, on top of application, PTY and kernel buffers;
 they are not host-wide memory limits. `UNMOOR_SYNC_BACKLOG_BYTES` and
 `UNMOOR_SYNC_PENDING_BYTES` change the endpoint you launch; do not assume an
-environment variable crosses SSH to the other endpoint. At 400000 B/s,
-draining a full classic 256 MiB backlog takes at least about eleven minutes.
+environment variable crosses SSH unless the wrapper documents it. At the
+client wrapper's interim 2 MB/s default, draining a full classic 256 MiB
+backlog still takes at least about 134 seconds; adaptive recovery remains
+planned because a fixed ceiling cannot provide prompt post-roam catch-up.
 An out-of-order record that cannot yet fit the pending window is repaired from
 the sender's retained history; it is not declared delivered.
 
@@ -605,7 +608,7 @@ wire budget (2400 B/s at the default MTU).
 | Variable | Scope and default |
 | --- | --- |
 | `UNMOOR_KEY` | Exactly 64 hex characters for direct pre-shared-key listen/connect. It is scrubbed after parsing and rejected by the recommended public bootstrap. |
-| `UNMOOR_PACE_BPS` | Token-bucket source-read pace in bytes/second; 0 or unset disables it. The wrapper forwards a valid value to the remote listener. |
+| `UNMOOR_PACE_BPS` | Token-bucket source-read pace in bytes/second; the binary default is off, while `bin/client.sh` supplies 2000000. An explicit 0 disables it. The wrapper forwards the value to the remote listener. |
 | `UNMOOR_SYNC` | Direct classic sessions only: `0` permits the legacy lossy PTY path. The recommended public bootstrap rejects that reduction. |
 | `UNMOOR_SYNC_BACKLOG_BYTES` | Transmit history. Classic default/min/max: 256 MiB/256 KiB/4 GiB. Channelised per-stream default/max: 16 MiB/64 MiB. |
 | `UNMOOR_SYNC_PENDING_BYTES` | Receive reorder storage. Classic default/min/max: 4 MiB/64 KiB/1 GiB. Channelised per-stream default/max: 1 MiB/4 MiB. |
