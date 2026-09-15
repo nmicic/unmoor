@@ -680,8 +680,8 @@ int channel_pty_pump_master(session_t *s)
     if (s->pty_master_fd < 0) return 0;
 
     int sync_on = sync_active(s);
-    size_t mtu = s->current_mtu ? s->current_mtu : 222;
-    uint8_t buf[256];
+    size_t mtu = s->current_mtu ? s->current_mtu : UNMOOR_TERMINAL_PLAINTEXT_MAX;
+    uint8_t buf[UNMOOR_TERMINAL_PLAINTEXT_MAX];
     size_t cap = mtu > sizeof(buf) ? sizeof(buf) : mtu;
     if (sync_on) {
         /* Include the sync record envelope in the read geometry. Under the
@@ -691,6 +691,7 @@ int channel_pty_pump_master(session_t *s)
         cap = sync_tx_read_limit(s);
         if (cap == 0) return 0;
     }
+    if (cap > sizeof(buf)) cap = sizeof(buf);
 
     ssize_t n = pty_owner_read(s, buf, cap);
     if (n > 0) {
@@ -818,16 +819,19 @@ int channel_pty_finish_stdin(session_t *s)
 
 int channel_pty_pump_stdin(session_t *s)
 {
-    uint8_t input[256];
-    uint8_t filtered[256];
+    uint8_t input[UNMOOR_TERMINAL_PLAINTEXT_MAX];
+    uint8_t filtered[UNMOOR_TERMINAL_PLAINTEXT_MAX];
+    _Static_assert(sizeof(filtered) >= sizeof(input),
+                   "escape filter output buffer must not be smaller than its input");
     int sync_on = sync_active(s);
     int escape_on = s->raw_mode_active;
-    size_t mtu = s->current_mtu ? s->current_mtu : 222;
+    size_t mtu = s->current_mtu ? s->current_mtu : UNMOOR_TERMINAL_PLAINTEXT_MAX;
     size_t cap = mtu > sizeof(input) ? sizeof(input) : mtu;
     if (sync_on) {
         cap = sync_tx_read_limit(s); /* quota + one-record bound (see master) */
         if (cap == 0) return 0;
     }
+    if (cap > sizeof(input)) cap = sizeof(input);
     /* A held escape plus an unknown second byte emits two bytes. Reserve one
      * input byte so the filtered chunk never exceeds the pre-filter wire/read
      * bound and never creates a new userspace queue. */

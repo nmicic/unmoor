@@ -68,8 +68,9 @@ int sync_work_plan_encode(uint8_t *output, size_t capacity,
 int sync_work_plan_decode(sync_work_header_t *header, sync_repair_view_t *view,
                           const uint8_t *input, size_t length);
 
-/* NONE/EXHAUSTED require zero offset/length. RANGE requires length 1..210
- * and a nonwrapping end. Checks only that canonical syntactic shape. The
+/* NONE/EXHAUSTED require zero offset/length. RANGE requires a length from 1
+ * to SYNC_PLAN_PAYLOAD_MAX and a nonwrapping end. Checks only that canonical
+ * syntactic shape. The
  * trusted caller separately checks the issued/current view with the existing
  * result guard before use. Codec success cannot authorize a chosen range. */
 int sync_work_planned_encode(uint8_t *output, size_t capacity,

@@ -101,6 +101,13 @@ host firewall and the provider firewall. The recommended bootstrap currently
 chooses that port dynamically; use the diagnostics in section 10 to
 distinguish an SSH/bootstrap failure from a blocked UDP path.
 
+Ordinary terminal traffic uses complete UDP payloads up to 1200 bytes, the
+same conservative Internet baseline required by QUIC. Protocol v2 does not yet
+probe for a larger or smaller per-path ceiling. Correctly configured IPv6,
+mobile and ordinary VPN paths normally carry this size; a path with a smaller
+effective MTU must be repaired or avoided. Automatic per-path discovery is
+planned separately and is not implied by the current roaming support.
+
 Once you are in:
 
 | Keys | Effect |

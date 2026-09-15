@@ -17,7 +17,10 @@ itself: every tracked file was scanned before publication for credentials,
 key material, host names, addresses, internal URLs and internal document
 references, and what that scan found was removed or reworded.
 
-This tree was cut from `unmoor 0.1.0 (protocol v1)` on 2026-09-15.
+The initial public tree was cut from `unmoor 0.1.0 (protocol v1)` on
+2026-09-15. The current tree is `unmoor 0.2.0 (protocol v2)`; its terminal
+datagram was raised from the small LoRa-oriented URTB inheritance to a
+1200-byte complete UDP payload.
 
 ## What is in the tree
 
@@ -86,9 +89,10 @@ The four BLAKE2b domain-separation constants a few hundred lines above it were
 deliberately left exactly as they are. Those strings feed the transfer hash
 tree whose root travels in the MANIFEST, ACK and STATUS records: changing them
 would make a build from this tree and a build from the development tree compute
-different roots for the same file, so the two would negotiate protocol v1
+different roots for the same file, so the two would negotiate the same protocol
 successfully and then fail every transfer. No change in this repository is
-wire-visible.
+made accidentally wire-visible; the later protocol-v2 terminal-datagram change
+is an explicit version break and mismatched endpoints refuse it.
 
 **One abstract-socket name, in `src/monitor_startup.c`.** The startup
 rendezvous socket was named after an internal work item; it is now

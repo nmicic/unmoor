@@ -298,10 +298,8 @@ static int chaos_drop(const char *dir, const uint8_t *frame, size_t len)
 
 /* --- tx shaping: delay + reorder (netem "delay"/"reorder" parity) ------- */
 
-#define CHAOS_QLEN     1024  /* must cover a burst: one PTY read fragments
-                              * into ~70 frames sent in a single loop
-                              * iteration; ~340KB BSS, chaos builds only */
-#define CHAOS_SLOT_MAX 320   /* frames are <= 300 (mtu 222 + hdr + tag) */
+#define CHAOS_QLEN     1024
+#define CHAOS_SLOT_MAX (FRAME_MAX_LEN)
 #define CHAOS_HOLD_MS  500   /* rescue deadline for a reorder hold */
 
 typedef struct {
@@ -2241,7 +2239,7 @@ session_t *session_create(transport_t *t,
     /* PTY defaults */
     s->pty_master_fd      = -1;
     s->pty_child_pid      = 0;
-    s->current_mtu        = 222;
+    s->current_mtu        = UNMOOR_TERMINAL_PLAINTEXT_MAX;
     s->client_exit_code   = 0;
     s->should_exit        = 0;
     s->raw_mode_active    = 0;
@@ -2272,7 +2270,8 @@ session_t *session_create(transport_t *t,
         errno = 0;
         long long bps = strtoll(pace_env, &end, 10);
         if (errno == 0 && end != pace_env && *end == '\0' && bps > 0) {
-            const int64_t mtu = s->current_mtu ? s->current_mtu : 222;
+            const int64_t mtu = s->current_mtu ? s->current_mtu
+                                               : UNMOOR_TERMINAL_PLAINTEXT_MAX;
             const int64_t max_burst = 16 * mtu;
             int64_t burst = (int64_t)bps / 4;
             if (burst < 1) burst = 1;
@@ -4348,7 +4347,8 @@ void session_pacer_charge_read(session_t *s, size_t read_len)
 {
     if (!s || s->pace_bps <= 0 || read_len == 0)
         return;
-    size_t mtu = s->current_mtu ? s->current_mtu : 222;
+    size_t mtu = s->current_mtu ? s->current_mtu
+                                : UNMOOR_TERMINAL_PLAINTEXT_MAX;
     size_t equivalent = read_len > mtu ? read_len : mtu;
     /* Current pumps cap reads at 256 bytes. Keep this helper safe if a future
      * caller violates that contract rather than wrapping the credit. */
@@ -4489,7 +4489,7 @@ int session_enable_pq_hybrid(session_t *s)
 
     if (!s || s->state != SESSION_IDLE || s->configuration_frozen ||
         !s->epoch_rekey_enabled || s->pq_hybrid_enabled ||
-        pq_rekey_geometry(s->current_mtu, &stride, &count) != 0)
+        pq_rekey_geometry(PQ_REKEY_CONTROL_MTU, &stride, &count) != 0)
         return -1;
     (void)stride;
     (void)count;
@@ -8404,7 +8404,7 @@ static int pq_rekey_tx_arm(session_t *s, uint8_t kind,
 
     if (!s || !share || !pq_rekey_selected(s) ||
         (kind != PQ_REKEY_KIND_INIT && kind != PQ_REKEY_KIND_REPLY) ||
-        pq_rekey_geometry(s->current_mtu, &stride, &count) != 0)
+        pq_rekey_geometry(PQ_REKEY_CONTROL_MTU, &stride, &count) != 0)
         return -1;
     tx = &s->pq_rekey_tx;
     if (tx->active)
@@ -8807,9 +8807,9 @@ static int wire_encode_pq_share(session_t *s, int64_t now_ms)
     if ((remaining & (UINT32_C(1) << index)) == 0U ||
         pq_rekey_share_descriptor_make(
             &descriptor, tx->kind, tx->from_epoch, tx->rekey_id, index,
-            s->current_mtu) != 0 ||
+            PQ_REKEY_CONTROL_MTU) != 0 ||
         pq_rekey_share_descriptor_encode(descriptor_wire, &descriptor,
-                                         s->current_mtu) != 0)
+                                         PQ_REKEY_CONTROL_MTU) != 0)
         return -1;
 
     seq = s->tx_seq;
@@ -9189,7 +9189,7 @@ static unsigned int pq_rekey_role_budget(const session_t *s, int server)
     uint16_t stride;
     uint8_t count;
 
-    if (!s || pq_rekey_geometry(s->current_mtu, &stride, &count) != 0)
+    if (!s || pq_rekey_geometry(PQ_REKEY_CONTROL_MTU, &stride, &count) != 0)
         return 0U;
     (void)stride;
     return (unsigned int)(2U * count + (server ? 2U : 3U));
@@ -9482,7 +9482,7 @@ static void handle_pq_share(session_t *s,
     if (pending_frame || !descriptor_wire || !payload ||
         pq_rekey_share_descriptor_decode(
             descriptor_wire, PQ_REKEY_SHARE_DESCRIPTOR_LEN,
-            s->current_mtu, &descriptor) != 0 ||
+            PQ_REKEY_CONTROL_MTU, &descriptor) != 0 ||
         descriptor.kind != expected_kind) {
         rekey_fail(s, "invalid pq-hybrid SHARE grammar, role or epoch");
         return;
@@ -9524,7 +9524,7 @@ static void handle_pq_share(session_t *s,
         return;
     }
     rc = pq_rekey_rx_accept(&s->pq_rekey_rx, &descriptor,
-                            payload, payload_len, s->current_mtu, now_ms);
+                            payload, payload_len, PQ_REKEY_CONTROL_MTU, now_ms);
     if (rc == PQ_REKEY_RX_BUSY) {
         fprintf(stderr,
                 "session: unrelated pq-hybrid SHARE rejected while busy\n");
@@ -10561,7 +10561,8 @@ static void enter_idle(session_t *s)
      * seam mirrors that fact into the scheduler; doing this earlier leaves
      * the next session's mandatory bootstrap REKEY incorrectly rate-gated. */
     (void)session_wire_scheduler_reset(s, s->pace_bps,
-                              s->current_mtu ? s->current_mtu : 222,
+                              s->current_mtu ? s->current_mtu
+                                             : UNMOOR_TERMINAL_PLAINTEXT_MAX,
                               mono_ms());
     s->epoch                   = 0;
     s->rekey_phase             = REKEY_NONE;
@@ -11178,7 +11179,8 @@ static void establish_session(session_t *s)
     }
     if (multipath_count != 0U)
         fprintf(stderr,
-                "session: negotiated wire=v1 caps=0x%08X (%s) multipath-paths=%u%s\n",
+                "session: negotiated wire=v%d caps=0x%08X (%s) multipath-paths=%u%s\n",
+                UNMOOR_PROTO_VERSION,
                 s->selected_caps,
                 capability_names(s->selected_caps &
                                  ~UNMOOR_CAP_MULTIPATH_D32_MASK),
@@ -11186,7 +11188,8 @@ static void establish_session(session_t *s)
                 s->peer_legacy ? " peer=legacy" : "");
     else
         fprintf(stderr,
-                "session: negotiated wire=v1 caps=0x%08X (%s)%s\n",
+                "session: negotiated wire=v%d caps=0x%08X (%s)%s\n",
+                UNMOOR_PROTO_VERSION,
                 s->selected_caps, capability_names(s->selected_caps),
                 s->peer_legacy ? " peer=legacy" : "");
     if (s->bulk_enabled &&
@@ -12961,7 +12964,7 @@ static void channel_application_pump_process_source(session_t *s,
                                                     uint8_t slot)
 {
     session_channel_application_t *app;
-    uint8_t bytes[512];
+    uint8_t bytes[UNMOOR_TERMINAL_PLAINTEXT_MAX];
     size_t limit;
     ssize_t received;
 
@@ -14254,7 +14257,7 @@ void session_replay_stashed_frame(session_t *s)
 
 void session_replay_stashed_frame_at(session_t *s, int64_t preauth_now_ms)
 {
-    uint8_t plaintext[512];
+    uint8_t plaintext[UNMOOR_TERMINAL_PLAINTEXT_MAX];
     size_t plaintext_capacity = sizeof(plaintext);
     uint8_t ad[10 + FRAGMENT_DESC_LEN];
     const uint8_t *dec_ct;
@@ -14601,7 +14604,7 @@ static void process_frame_impl(session_t *s, const uint8_t *frame,
     /* AEAD decrypt.  Bulk-transfer decrypts exactly in place inside its distinct
      * negotiated receive arena; the encoded outbound arena is never touched.
      * Existing classes retain the original fixed 512-byte stack scratch. */
-    uint8_t legacy_plaintext[512];
+    uint8_t legacy_plaintext[UNMOOR_TERMINAL_PLAINTEXT_MAX];
     uint8_t *plaintext = legacy_plaintext;
     size_t plaintext_capacity = sizeof(legacy_plaintext);
     size_t pt_len = 0;
@@ -15686,7 +15689,8 @@ int session_send_lane_tracked(session_t *s, send_lane_t lane,
         }
         wire_plaintext_len = plaintext_len + CHANNEL_SESSION_HANDLE_BYTES;
         if (wire_plaintext_len >
-            (size_t)(s->current_mtu ? s->current_mtu : 222U)) {
+            (size_t)(s->current_mtu ? s->current_mtu
+                                    : UNMOOR_TERMINAL_PLAINTEXT_MAX)) {
             fprintf(stderr,
                     "session_send: channel-session body exceeds physical plaintext budget\n");
             return -1;
@@ -15763,7 +15767,8 @@ int session_send_lane_tracked_instance(session_t *s, uint8_t stream_slot,
         return -1;
     wire_length = plaintext_len + CHANNEL_SESSION_HANDLE_BYTES;
     if (wire_length >
-        (size_t)(s->current_mtu ? s->current_mtu : 222U))
+        (size_t)(s->current_mtu ? s->current_mtu
+                                : UNMOOR_TERMINAL_PLAINTEXT_MAX))
         return -1;
     store32le(channelised, binding->handle);
     if (plaintext_len != 0U)
@@ -15865,7 +15870,8 @@ int session_send_data(session_t *s, uint8_t chan_id, uint8_t type,
         return -1;
     logical_length = plaintext_len + envelope;
 
-    size_t mtu = s->current_mtu ? s->current_mtu : 222;
+    size_t mtu = s->current_mtu ? s->current_mtu
+                                : UNMOOR_TERMINAL_PLAINTEXT_MAX;
     size_t max_mtu = FRAME_MAX_LEN - FRAME_HEADER_LEN - FRAME_TAG_LEN;
     if (mtu > max_mtu) {
         fprintf(stderr, "session_send_data: invalid mtu=%zu\n", mtu);
@@ -16023,7 +16029,7 @@ static void session_monitor_backend_failure(session_t *s,
 
 int session_run(session_t *s)
 {
-    uint8_t buf[600];
+    uint8_t buf[FRAME_MAX_LEN + 1];
     int result;
 
     if (!s)

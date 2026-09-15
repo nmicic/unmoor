@@ -7,16 +7,16 @@
 
 | Version | Supported |
 | --- | --- |
-| 0.1.0 (protocol v1) | current — fixes land on `main` |
+| 0.2.0 (protocol v2) | current — fixes land on `main` |
 | anything earlier | no |
 
-There is one line of development and no back-porting. Protocol v1 carries no
-compatibility promise yet: a fix for a protocol-level defect may change the
-wire format rather than work around it.
+There is one line of development and no back-porting. This experimental
+protocol carries no compatibility promise yet: endpoints with different wire
+versions refuse each other and the older endpoint must be upgraded.
 
 ## Status of this code
 
-Unmoor is version 0.1.0. It has been specified, implemented, reviewed and
+Unmoor is version 0.2.0. It has been specified, implemented, reviewed and
 tested inside this project — including a two-machine gate that runs complete
 sessions across a routed, impaired network path, reported in `SOURCE.md` — and
 **it has had no external security audit**. The cryptographic construction is

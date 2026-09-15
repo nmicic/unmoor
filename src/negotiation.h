@@ -16,7 +16,8 @@
 #define NEGOTIATION_NONCE_LEN 16U
 #define NEGOTIATION_READY_LEN 8U
 
-#define NEGOTIATION_HELLO_VERSION 0x02U
+/* Advanced with protocol v2. Every other value is incompatible. */
+#define NEGOTIATION_HELLO_VERSION 0x03U
 #define NEGOTIATION_MARKER_BIT    0x80U
 #define NEGOTIATION_READY_VERSION 0x01U
 #define NEGOTIATION_READY_NEED_ACK 0x01U
@@ -96,8 +97,10 @@ void negotiation_encode_ack(uint8_t out[NEGOTIATION_PLAIN_LEN],
                             uint16_t status);
 
 /* Decode and validate canonical grammar. Returns 0 or ERR_VERSION/ERR_CAPS.
- * A legacy plaintext is exactly version 0x02, marker clear, and fourteen
- * zero reserved bytes. Unknown legacy caps are ignored except PTY_V1. */
+ * A legacy plaintext is exactly NEGOTIATION_HELLO_VERSION, marker clear, and
+ * fourteen zero reserved bytes. It is a grammar difference inside the current
+ * wire generation, not compatibility with an older protocol. Unknown legacy
+ * caps are ignored except PTY_V1. */
 uint16_t negotiation_decode(const uint8_t *plain, size_t plain_len,
                             int is_ack, negotiation_message_t *out);
 

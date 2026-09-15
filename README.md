@@ -15,15 +15,16 @@ Bridge)](https://github.com/nmicic/URTB). URTB carries a terminal across USB
 and radio links; Unmoor is the network version of that work, built for
 authenticated UDP sessions across changing addresses, NAT mappings and paths.
 
-`unmoor 0.1.0 (protocol v1)`. C11, macOS and Linux. Every library it links is
+`unmoor 0.2.0 (protocol v2)`. C11, macOS and Linux. Every library it links is
 vendored here, so the build pulls nothing from the network; running it the
 recommended way also uses the Bash and OpenSSH client already on your machine,
 because the bootstrap starts the far side over SSH.
 
 ## Status: experimental
 
-Unmoor is version 0.1.0. Protocol v1 will change without a compatibility
-promise until this section says otherwise. The PQ handshake, the confinement
+Unmoor is version 0.2.0. The protocol will change without a compatibility
+promise until this section says otherwise; endpoints with different protocol
+versions must be upgraded to the same release. The PQ handshake, the confinement
 defaults and the roaming rule have been specified, implemented, reviewed and
 tested inside this project — including a two-machine gate that runs whole
 sessions across a routed, impaired network path, reported in
@@ -57,7 +58,10 @@ service. Its useful property is the combination of these behaviours:
   Absolute offsets, a pending bitmap and a running hash let the receiver repair
   loss and reordering and let the sender prune confirmed history. The client
   exposes `SYNC`, `OUT-OF-SYNC` and `STALLED` instead of silently pretending a
-  gap was delivered.
+  gap was delivered. Ordinary terminal traffic uses a 1200-byte complete UDP
+  payload, the conservative Internet baseline also used by QUIC. The earlier
+  small packet budget came from URTB's LoRa-oriented transport rather than a
+  network-path requirement.
 - **Several authenticated UDP legs may share one session.** A leg count is
   always a power of two from 2 to 32, but the default `enterprise` profile
   fixes it at 2 for a terminal and 4 for a transfer and refuses any other

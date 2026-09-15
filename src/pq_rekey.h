@@ -10,6 +10,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "frame.h"
+
 #define PQ_REKEY_VERSION 1U
 #define PQ_REKEY_SUITE 1U
 #define PQ_REKEY_KIND_INIT 1U
@@ -24,6 +26,23 @@
 #define PQ_REKEY_FRAGMENT_MAX 27U
 #define PQ_REKEY_ASSEMBLY_MS 5000
 #define PQ_REKEY_RETRY_MS 500
+
+/* Hybrid key-establishment fragmentation is a fixed control grammar, not a
+ * terminal-MTU tuning knob. Keep its existing geometry when ordinary terminal
+ * datagrams grow. */
+#define PQ_REKEY_CONTROL_MTU ((size_t)UNMOOR_CONTROL_PLAINTEXT_MAX)
+#define PQ_REKEY_CONTROL_STRIDE \
+    (PQ_REKEY_CONTROL_MTU - PQ_REKEY_SHARE_DESCRIPTOR_LEN)
+#define PQ_REKEY_CONTROL_FRAGMENTS \
+    ((PQ_REKEY_SHARE_LEN + PQ_REKEY_CONTROL_STRIDE - 1U) / \
+     PQ_REKEY_CONTROL_STRIDE)
+
+_Static_assert(PQ_REKEY_CONTROL_MTU >= PQ_REKEY_MTU_MIN &&
+                   PQ_REKEY_CONTROL_MTU <= PQ_REKEY_MTU_MAX,
+               "hybrid control carriage outside the share-grammar MTU bounds");
+_Static_assert(PQ_REKEY_CONTROL_FRAGMENTS >= PQ_REKEY_FRAGMENT_MIN &&
+                   PQ_REKEY_CONTROL_FRAGMENTS <= PQ_REKEY_FRAGMENT_MAX,
+               "hybrid control carriage yields an illegal share fragment count");
 
 enum {
     PQ_REKEY_RX_ACCEPTED = 0,

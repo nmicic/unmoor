@@ -9,10 +9,14 @@
 
 #include <stdint.h>
 
+#include "frame.h"
+#include "sync.h"
+
 #define SYNC_PLAN_GRID         64U
 #define SYNC_PLAN_BITMAP_MAX  170U
 #define SYNC_PLAN_BITS_MAX   1360U
-#define SYNC_PLAN_PAYLOAD_MAX 210U
+#define SYNC_PLAN_PAYLOAD_MAX \
+    (UNMOOR_TERMINAL_PLAINTEXT_MAX - SYNC_DATA_OVERHEAD)
 
 /* Caller-owned immutable view, not an IPC encoding or authority grant.
  * Cursor is already normalized to >= frontier. Limit is the trusted

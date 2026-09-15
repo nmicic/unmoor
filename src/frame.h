@@ -16,8 +16,11 @@
  * Constants
  * ---------------------------------------------------------------------- */
 
-#define UNMOOR_VERSION       "0.1.0"
-#define UNMOOR_PROTO_VERSION 1
+/* Protocol v2 moves ordinary terminal traffic from the small radio-oriented
+ * budget inherited from URTB to an Internet-sized UDP datagram. A mismatched
+ * peer is refused; this experimental protocol has no downgrade path. */
+#define UNMOOR_VERSION       "0.2.0"
+#define UNMOOR_PROTO_VERSION 2
 
 /* Wire frame layout. For multi-fragment data, CIPHERTEXT begins with a clear
  * 16-byte descriptor whose bytes are authenticated as extended AEAD AD; the
@@ -26,7 +29,16 @@
 #define FRAME_TAG_LEN       16  /* Poly1305 auth tag */
 #define FRAME_MIN_CT_LEN    16  /* empty plaintext + tag */
 #define FRAME_MIN_LEN       (FRAME_HEADER_LEN + FRAME_MIN_CT_LEN)  /* 28 */
-#define FRAME_MAX_LEN       510 /* largest frame any transport will accept */
+
+/* Complete ordinary terminal datagram, including the Unmoor header and tag.
+ * The separate control budget keeps the hybrid bootstrap/rekey geometry
+ * stable while terminal traffic can efficiently use normal network paths. */
+#define UNMOOR_TERMINAL_WIRE_MAX       1200
+#define UNMOOR_TERMINAL_PLAINTEXT_MAX  \
+    (UNMOOR_TERMINAL_WIRE_MAX - FRAME_HEADER_LEN - FRAME_TAG_LEN) /* 1172 */
+#define UNMOOR_CONTROL_PLAINTEXT_MAX   222
+
+#define FRAME_MAX_LEN       UNMOOR_TERMINAL_WIRE_MAX
 
 /* Channel byte fragment flags */
 #define CHAN_FF_BIT          0x02  /* FIRST_FRAGMENT */

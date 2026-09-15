@@ -520,7 +520,7 @@ struct session {
     uint8_t  stashed_chan_byte;
     uint8_t  stashed_type;
     uint32_t stashed_seq;
-    uint8_t  stashed_ct[600];
+    uint8_t  stashed_ct[UNMOOR_TERMINAL_PLAINTEXT_MAX + FRAME_TAG_LEN];
     size_t   stashed_ct_len;
     uint8_t  stashed_ad[10];
     multipath_token_t stashed_path;

@@ -59,6 +59,6 @@ pq_probe_result_t pq_probe_classify(const uint8_t *stdout_bytes,
         return PQ_PROBE_SUPPORTED;
     if (stdout_len == sizeof(legacy) - 1U &&
         memcmp(stdout_bytes, legacy, sizeof(legacy) - 1U) == 0)
-        return PQ_PROBE_LEGACY;
+        return PQ_PROBE_INCOMPATIBLE_V1;
     return PQ_PROBE_ERROR;
 }

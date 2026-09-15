@@ -13,14 +13,13 @@
 #define PQ_HYBRID_SUITE_NAME \
     "pq-hybrid-x25519-mlkem1024-xchacha20-blake2b-v1"
 #define PQ_PROBE_SUPPORTED_TEXT "UNMOOR PQ-HYBRID v1\n"
+/* Frozen identity printed by the old peer. It deliberately does not track
+ * this binary's version. */
 #define PQ_PROBE_LEGACY_TEXT "unmoor 0.1.0 (protocol v1)\n"
-#define PQ_PREFER_FALLBACK_NOTICE \
-    "unmoor: peer lacks " PQ_HYBRID_SUITE_NAME \
-    "; continuing with v1 (--pq=prefer)\n"
-#define PQ_REQUIRE_REFUSAL_NOTICE \
-    "unmoor: PQ required but peer lacks " PQ_HYBRID_SUITE_NAME \
-    " (default --pq=require; use --pq=prefer for one visible v1 fallback " \
-    "or --pq=off for legacy)\n"
+#define PQ_PROBE_V1_REFUSAL_NOTICE \
+    "unmoor: remote speaks protocol v1 and cannot establish with this " \
+    "protocol-v2 client; upgrade the remote " \
+    "(no --pq policy restores v1 compatibility)\n"
 
 typedef enum pq_policy {
     PQ_POLICY_OFF = 0,
@@ -30,7 +29,7 @@ typedef enum pq_policy {
 
 typedef enum pq_probe_result {
     PQ_PROBE_ERROR = -1,
-    PQ_PROBE_LEGACY = 0,
+    PQ_PROBE_INCOMPATIBLE_V1 = 0,
     PQ_PROBE_SUPPORTED = 1
 } pq_probe_result_t;
 

@@ -35,6 +35,7 @@
 #include <sys/types.h>
 
 #include "crypto.h"
+#include "frame.h"
 #include "sync_backlog.h"
 
 struct session;
@@ -45,8 +46,11 @@ struct session;
 
 #define SYNC_GRID              64U     /* bitmap block size, bytes */
 #define SYNC_DATA_OVERHEAD     12U     /* ver+flags+reserved2+offset8 */
-#define SYNC_DATA_PAYLOAD_MAX  210U    /* 222-byte plaintext budget - 12 */
+#define SYNC_DATA_PAYLOAD_MAX  \
+    (UNMOOR_TERMINAL_PLAINTEXT_MAX - SYNC_DATA_OVERHEAD) /* 1160 */
 #define SYNC_ACK_OVERHEAD      52U     /* ver+flags+bits2+frontier8+credit8+chain32 */
+/* ACKs retain the compact control geometry; a larger DATA record does not
+ * require a proportionally larger frontier-anchored bitmap. */
 #define SYNC_ACK_BITMAP_MAX    170U    /* bitmap bytes: 52 + 170 = 222 */
 #define SYNC_ACK_BITS_MAX      1360U   /* 170 * 8 */
 #define SYNC_INITIAL_CREDIT    65536U  /* assumed before the first ack */

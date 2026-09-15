@@ -2860,12 +2860,9 @@ int d28_runtime_ssh_connect(const d28_ssh_connect_config_t *config,
 
             if (probe == PQ_PROBE_SUPPORTED) {
                 use_pq = 1;
-            } else if (probe == PQ_PROBE_LEGACY &&
-                       config->pq_policy == PQ_POLICY_PREFER) {
-                (void)fputs(PQ_PREFER_FALLBACK_NOTICE, stderr);
-                use_pq = 0;
-            } else if (probe == PQ_PROBE_LEGACY) {
-                (void)fputs(PQ_REQUIRE_REFUSAL_NOTICE, stderr);
+            } else if (probe == PQ_PROBE_INCOMPATIBLE_V1) {
+                /* This experimental protocol has no downgrade path. */
+                (void)fputs(PQ_PROBE_V1_REFUSAL_NOTICE, stderr);
                 goto cleanup;
             } else {
                 fprintf(stderr,

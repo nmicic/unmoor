@@ -59,17 +59,9 @@ static int  g_failed;
 /* Wire constants (mirror the protocol wire format)                          */
 /* ------------------------------------------------------------------------- */
 
-#define FRAME_HEADER_LEN    12  /* PAIR_ID[4] SEQ[4] CHAN[1] TYPE[1] LEN[2] */
-#define FRAME_TAG_LEN       16  /* Poly1305 */
-#define FRAME_MIN_CT_LEN    16  /* empty plaintext + tag */
-#define FRAME_MIN_LEN       (FRAME_HEADER_LEN + FRAME_MIN_CT_LEN)  /* 28 */
-#define FRAME_MAX_LEN       510  /* absolute on-wire cap */
-#define FRAME_DEFAULT_DGRAM 250  /* session's default datagram budget */
-#define MAX_PT_DEFAULT      (FRAME_DEFAULT_DGRAM - FRAME_HEADER_LEN - FRAME_TAG_LEN) /* 222 */
-#define MAX_PT_CEILING      (FRAME_MAX_LEN - FRAME_HEADER_LEN - FRAME_TAG_LEN)       /* 482 */
-
-#define CHAN_FF_BIT         0x02  /* FIRST_FRAGMENT */
-#define CHAN_MF_BIT         0x01  /* MORE_FRAGMENTS */
+#define FRAME_DEFAULT_DGRAM UNMOOR_TERMINAL_WIRE_MAX
+#define MAX_PT_DEFAULT      UNMOOR_TERMINAL_PLAINTEXT_MAX
+#define MAX_PT_CEILING      (FRAME_MAX_LEN - FRAME_HEADER_LEN - FRAME_TAG_LEN)
 
 /* Replay window */
 #define REPLAY_WINDOW       256
@@ -287,11 +279,13 @@ static void test_group2_frames(void)
                            PREFILTER_ACCEPT);
     }
 
-    /* 2-06: default MTU plaintext budget (session.c current_mtu) */
-    CHECK("2-06 default_max_plaintext_222", MAX_PT_DEFAULT == 222);
+    /* 2-06: ordinary terminal datagram and its plaintext budget */
+    CHECK("2-06 terminal_datagram_1200_plaintext_1172",
+          FRAME_DEFAULT_DGRAM == 1200 && MAX_PT_DEFAULT == 1172);
 
     /* 2-07: absolute plaintext ceiling at FRAME_MAX_LEN */
-    CHECK("2-07 ceiling_max_plaintext_482", MAX_PT_CEILING == 482);
+    CHECK("2-07 ceiling_is_the_terminal_datagram",
+          FRAME_MAX_LEN == FRAME_DEFAULT_DGRAM && MAX_PT_CEILING == 1172);
 
     /* 2-08: a frame at the wire cap encodes; one byte over is rejected */
     {
@@ -302,7 +296,7 @@ static void test_group2_frames(void)
                                out, FRAME_MAX_LEN);
         int bad = frame_encode(pair_id, 0, 0x10, 0x01, big, sizeof(big) + 1,
                                out, FRAME_MAX_LEN);
-        CHECK("2-08 wire_cap_510_boundary",
+        CHECK("2-08 wire_cap_1200_boundary",
               ok == FRAME_MAX_LEN && bad < 0);
     }
 
@@ -544,7 +538,7 @@ static void test_group3_aead(void)
 
         uint8_t hello_pt[32];
         memset(hello_pt, 0, sizeof(hello_pt));
-        hello_pt[0] = 0x02;  /* version = 0x02 (per-send hello nonce) */
+        hello_pt[0] = NEGOTIATION_HELLO_VERSION;
         hello_pt[1] = 0x01;  /* caps = PTY */
         for (int i = 0; i < 16; i++) hello_pt[2 + i] = (uint8_t)(0x10 + i);
 
@@ -1475,7 +1469,7 @@ static void test_group8_negotiation(void)
      * offset 18 — a silent change to the default offer fails here first. */
     {
         static const uint8_t want[NEGOTIATION_PLAIN_LEN] = {
-            0x02,0xf7,0x00,0x01,0x02,0x03,0x04,0x05,
+            0x03,0xf7,0x00,0x01,0x02,0x03,0x04,0x05,
             0x06,0x07,0x08,0x09,0x0a,0x0b,0x0c,0x0d,
             0x0e,0x0f,0x77,0x00,0x00,0x00,0x01,0x00,
             0x00,0x00,0x00,0x00,0x4e,0x45,0x47,0x31,
@@ -1509,6 +1503,20 @@ static void test_group8_negotiation(void)
         plain[18] = 1;
         CHECK("8-05 legacy_reserved_nonzero_rejected",
               negotiation_decode(plain, sizeof(plain), 0, &msg) == ERR_VERSION);
+    }
+
+    /* A previous protocol version is incompatible in either direction. */
+    {
+        uint8_t plain[NEGOTIATION_PLAIN_LEN];
+        negotiation_message_t msg;
+        negotiation_encode_hello(plain, na,
+                                 UNMOOR_CAP_DEFAULT_SUPPORTED,
+                                 UNMOOR_CAP_DEFAULT_REQUIRED);
+        plain[0] = (uint8_t)(NEGOTIATION_HELLO_VERSION - 1U);
+        uint16_t hello_rc = negotiation_decode(plain, sizeof(plain), 0, &msg);
+        uint16_t ack_rc = negotiation_decode(plain, sizeof(plain), 1, &msg);
+        CHECK("8-05a previous_wire_version_is_incompatible",
+              hello_rc == ERR_VERSION && ack_rc == ERR_VERSION);
     }
 
     /* 8-06..08: redundant low bits, required subset, and HELLO status are
@@ -1593,10 +1601,10 @@ static void test_group8_negotiation(void)
      * or the selected mask changes the key. */
     {
         static const uint8_t want[32] = {
-            0xbd,0xa5,0x04,0x47,0x19,0xaa,0x62,0x35,
-            0x00,0xb4,0xc8,0x3b,0xcc,0xaa,0x5a,0xf8,
-            0xd3,0xaf,0x3c,0xfb,0xda,0xb3,0x14,0xef,
-            0x4a,0xd1,0x44,0x16,0xd2,0x3c,0x82,0x05,
+            0xca,0x71,0xac,0xf4,0xd4,0x0b,0x2c,0x24,
+            0xed,0x06,0xa3,0x2c,0x47,0x16,0x0a,0xe3,
+            0x42,0xa4,0x54,0x60,0xe6,0xb1,0x6d,0xb9,
+            0xbc,0x79,0x72,0xa4,0x55,0xa8,0xc0,0x70,
         };
         uint8_t psk[32], hello[32], ack[32];
         uint8_t k1[32], k2[32], k3[32], legacy[32];
@@ -1983,13 +1991,13 @@ static void test_group8_negotiation(void)
         negotiation_encode_hello(hello, na, hybrid, base);
         rc = negotiation_decode(hello, sizeof(hello), 0, &msg);
         rc |= negotiation_select(&msg, base, base, &selected);
-        CHECK("8-50 prefer_intersects_unoffered_d45_to_exact_v1_bundle",
+        CHECK("8-50 prefer_intersects_unoffered_d45_to_classical_bundle",
               rc == 0 && selected == base);
 
         negotiation_encode_hello(hello, na, hybrid, hybrid);
         rc = negotiation_decode(hello, sizeof(hello), 0, &msg);
         rc |= negotiation_select(&msg, base, base, &selected);
-        CHECK("8-51 required_d45_refuses_v1_only_peer",
+        CHECK("8-51 required_d45_refuses_classical_only_peer",
               rc == ERR_CAPS && selected == base);
 
         negotiation_encode_hello(hello, na, hybrid, hybrid);
