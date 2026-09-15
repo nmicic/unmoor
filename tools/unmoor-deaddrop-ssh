@@ -1,0 +1,415 @@
+#!/usr/bin/env bash
+# Copyright (c) 2026 Nenad Micic
+# SPDX-License-Identifier: Apache-2.0
+#
+# Recommended epoch-rekey bootstrap wrapper.  Unlike a key-carrying ssh
+# bootstrap, this shell never receives key material: it validates the
+# operator-facing boundary and execs the long-lived local C endpoint.
+# SSH carries only public records.
+
+set -uo pipefail
+
+remote_cmd=unmoor
+local_bin=
+udp_host=
+remote_bind_host=
+timeout_secs=60
+remote_foreground=0
+traffic_profile=enterprise
+profile_seen=0
+log_format=text
+log_format_seen=0
+multipath_bare=0
+multipath_exact=0
+port_layout=block
+port_layout_seen=0
+port_mask=
+port_mask_seen=0
+channelised=0
+pq_policy=require
+pq_seen=0
+attach_socket=
+attach_socket_seen=0
+confine_level=
+confine_seen=0
+server_confine_level=
+server_confine_seen=0
+confine_roots=()
+ssh_args=()
+
+usage() {
+    cat >&2 <<'EOF'
+usage: unmoor-deaddrop-ssh [--local PATH] [--remote CMD] [--udp-host HOST]
+                           [--remote-bind-host HOST]
+                           [--timeout SECS] [--remote-foreground]
+                           [--profile enterprise|lab]
+                           [--log-format text|json]
+                           [--pq off|prefer|require]
+                           [--multipath[=2|4|8|16|32]]
+                           [--channelised]
+                           [--attach-socket PATH]
+                           [--confine off|best-effort|require]
+                           [--server-confine off|best-effort|require]
+                           [--confine-root PATH]...
+                           [--port-layout block|cube|random]
+                           [--port-mask 0xNNNN]
+                           [ssh-options...] [user@]host
+
+The last argument is the SSH destination.  The UDP host defaults to its host
+part; use --udp-host when an SSH alias does not resolve on the UDP path.
+--pq defaults to require; use prefer explicitly for a visible v1-only peer
+fallback, or off explicitly for the legacy profile.
+--attach-socket is local-only, requires --channelised, and is never sent over
+SSH or included in the remote listener command.  Port layout/mask likewise
+configure only child transfers launched through that local socket.
+--confine and --confine-root are local-only.  On Linux builds whose default is
+require, --confine=best-effort is the explicit own-risk continuation when a
+required kernel mechanism is unavailable.
+--server-confine is explicit and applies only to one-shot child-transfer bulk
+servers; it requires --channelised plus --attach-socket.  Omission changes no
+server.
+EOF
+}
+
+set_confine_level() {
+    local candidate=$1
+
+    [[ "$candidate" == off || "$candidate" == best-effort ||
+       "$candidate" == require ]] || {
+        echo "unmoor-deaddrop-ssh: --confine must be off, best-effort, or require" >&2
+        exit 2
+    }
+    if (( confine_seen )) && [[ "$confine_level" != "$candidate" ]]; then
+        echo "unmoor-deaddrop-ssh: conflicting --confine values" >&2
+        exit 2
+    fi
+    confine_level=$candidate
+    confine_seen=1
+}
+
+set_server_confine_level() {
+    local candidate=$1
+
+    [[ "$candidate" == off || "$candidate" == best-effort ||
+       "$candidate" == require ]] || {
+        echo "unmoor-deaddrop-ssh: --server-confine must be off, best-effort, or require" >&2
+        exit 2
+    }
+    if (( server_confine_seen )) &&
+       [[ "$server_confine_level" != "$candidate" ]]; then
+        echo "unmoor-deaddrop-ssh: conflicting --server-confine values" >&2
+        exit 2
+    fi
+    server_confine_level=$candidate
+    server_confine_seen=1
+}
+
+set_pq_policy() {
+    local candidate=$1
+
+    [[ "$candidate" == off || "$candidate" == prefer ||
+       "$candidate" == require ]] || {
+        echo "unmoor-deaddrop-ssh: --pq must be off, prefer, or require" >&2
+        exit 2
+    }
+    if (( pq_seen )) && [[ "$pq_policy" != "$candidate" ]]; then
+        echo "unmoor-deaddrop-ssh: conflicting --pq values" >&2
+        exit 2
+    fi
+    pq_policy=$candidate
+    pq_seen=1
+}
+
+set_multipath_exact() {
+    local candidate=$1
+
+    case "$candidate" in
+        2|4|8|16|32) ;;
+        *)
+            echo "unmoor-deaddrop-ssh: --multipath requires one exact count: 2,4,8,16,32" >&2
+            exit 2
+            ;;
+    esac
+    if (( multipath_exact )) && [[ "$multipath_exact" != "$candidate" ]]; then
+        echo "unmoor-deaddrop-ssh: conflicting --multipath counts" >&2
+        exit 2
+    fi
+    multipath_exact=$candidate
+}
+
+set_profile() {
+    local candidate=$1
+    [[ "$candidate" == enterprise || "$candidate" == lab ]] || {
+        echo "unmoor-deaddrop-ssh: --profile must be enterprise or lab" >&2
+        exit 2
+    }
+    if (( profile_seen )) && [[ "$traffic_profile" != "$candidate" ]]; then
+        echo "unmoor-deaddrop-ssh: conflicting --profile values" >&2
+        exit 2
+    fi
+    traffic_profile=$candidate
+    profile_seen=1
+}
+
+set_log_format() {
+    local candidate=$1
+    [[ "$candidate" == text || "$candidate" == json ]] || {
+        echo "unmoor-deaddrop-ssh: --log-format must be text or json" >&2
+        exit 2
+    }
+    if (( log_format_seen )) && [[ "$log_format" != "$candidate" ]]; then
+        echo "unmoor-deaddrop-ssh: conflicting --log-format values" >&2
+        exit 2
+    fi
+    log_format=$candidate
+    log_format_seen=1
+}
+
+set_port_layout() {
+    local candidate=$1
+
+    [[ "$candidate" == block || "$candidate" == cube ||
+       "$candidate" == random ]] || {
+        echo "unmoor-deaddrop-ssh: --port-layout must be block, cube, or random" >&2
+        exit 2
+    }
+    if (( port_layout_seen )) && [[ "$port_layout" != "$candidate" ]]; then
+        echo "unmoor-deaddrop-ssh: conflicting --port-layout values" >&2
+        exit 2
+    fi
+    port_layout=$candidate
+    port_layout_seen=1
+}
+
+set_port_mask() {
+    local candidate=$1
+
+    [[ "$candidate" =~ ^0x[0-9A-Fa-f]{1,4}$ ]] &&
+        (( 16#${candidate#0x} >= 1 && 16#${candidate#0x} <= 0x3fff )) || {
+        echo "unmoor-deaddrop-ssh: --port-mask must be 0x0001..0x3fff" >&2
+        exit 2
+    }
+    if (( port_mask_seen )) && [[ "$port_mask" != "$candidate" ]]; then
+        echo "unmoor-deaddrop-ssh: conflicting --port-mask values" >&2
+        exit 2
+    fi
+    port_mask=$candidate
+    port_mask_seen=1
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --remote) [[ $# -ge 2 ]] || { usage; exit 2; }; remote_cmd=$2; shift 2 ;;
+        --local) [[ $# -ge 2 ]] || { usage; exit 2; }; local_bin=$2; shift 2 ;;
+        --udp-host) [[ $# -ge 2 ]] || { usage; exit 2; }; udp_host=$2; shift 2 ;;
+        --remote-bind-host) [[ $# -ge 2 ]] || { usage; exit 2; }; remote_bind_host=$2; shift 2 ;;
+        --timeout) [[ $# -ge 2 ]] || { usage; exit 2; }; timeout_secs=$2; shift 2 ;;
+        --remote-foreground) remote_foreground=1; shift ;;
+        --profile) [[ $# -ge 2 ]] || { usage; exit 2; }; set_profile "$2"; shift 2 ;;
+        --profile=*) set_profile "${1#--profile=}"; shift ;;
+        --log-format) [[ $# -ge 2 ]] || { usage; exit 2; }; set_log_format "$2"; shift 2 ;;
+        --log-format=*) set_log_format "${1#--log-format=}"; shift ;;
+        --pq) [[ $# -ge 2 ]] || { usage; exit 2; }; set_pq_policy "$2"; shift 2 ;;
+        --pq=*) set_pq_policy "${1#--pq=}"; shift ;;
+        --pq*)
+            echo "unmoor-deaddrop-ssh: --pq requires off, prefer, or require" >&2
+            exit 2
+            ;;
+        --multipath) multipath_bare=1; shift ;;
+        --multipath=*)
+            set_multipath_exact "${1#--multipath=}"
+            shift
+            ;;
+        --multipath*)
+            echo "unmoor-deaddrop-ssh: --multipath requires one exact count: 2,4,8,16,32" >&2
+            exit 2
+            ;;
+        --port-layout) [[ $# -ge 2 ]] || { usage; exit 2; }; set_port_layout "$2"; shift 2 ;;
+        --port-layout=*) set_port_layout "${1#--port-layout=}"; shift ;;
+        --port-layout*)
+            echo "unmoor-deaddrop-ssh: --port-layout requires block, cube, or random" >&2
+            exit 2
+            ;;
+        --port-mask) [[ $# -ge 2 ]] || { usage; exit 2; }; set_port_mask "$2"; shift 2 ;;
+        --port-mask=*) set_port_mask "${1#--port-mask=}"; shift ;;
+        --port-mask*)
+            echo "unmoor-deaddrop-ssh: --port-mask requires 0x0001..0x3fff" >&2
+            exit 2
+            ;;
+        --channelised) channelised=1; shift ;;
+        --channelised*)
+            echo "unmoor-deaddrop-ssh: --channelised takes no value" >&2
+            exit 2
+            ;;
+        --attach-socket)
+            [[ $# -ge 2 ]] || {
+                echo "unmoor-deaddrop-ssh: --attach-socket requires PATH" >&2
+                exit 2
+            }
+            attach_socket=$2
+            attach_socket_seen=1
+            shift 2
+            ;;
+        --attach-socket*)
+            echo "unmoor-deaddrop-ssh: use --attach-socket PATH" >&2
+            exit 2
+            ;;
+        --confine-root)
+            [[ $# -ge 2 && -n "$2" ]] || { usage; exit 2; }
+            confine_roots+=("$2")
+            (( ${#confine_roots[@]} <= 8 )) || {
+                echo "unmoor-deaddrop-ssh: --confine-root may appear at most 8 times" >&2
+                exit 2
+            }
+            shift 2
+            ;;
+        --confine-root*)
+            echo "unmoor-deaddrop-ssh: use --confine-root PATH" >&2
+            exit 2
+            ;;
+        --confine) [[ $# -ge 2 ]] || { usage; exit 2; }; set_confine_level "$2"; shift 2 ;;
+        --confine=*) set_confine_level "${1#--confine=}"; shift ;;
+        --confine*)
+            echo "unmoor-deaddrop-ssh: --confine requires off, best-effort, or require" >&2
+            exit 2
+            ;;
+        --server-confine) [[ $# -ge 2 ]] || { usage; exit 2; }; set_server_confine_level "$2"; shift 2 ;;
+        --server-confine=*) set_server_confine_level "${1#--server-confine=}"; shift ;;
+        --server-confine*)
+            echo "unmoor-deaddrop-ssh: --server-confine requires off, best-effort, or require" >&2
+            exit 2
+            ;;
+        -h|--help) usage; exit 0 ;;
+        *) ssh_args+=("$1"); shift ;;
+    esac
+done
+
+if (( attach_socket_seen && !channelised )); then
+    echo "unmoor-deaddrop-ssh: --attach-socket requires --channelised" >&2
+    exit 2
+fi
+if (( server_confine_seen && !attach_socket_seen )); then
+    echo "unmoor-deaddrop-ssh: --server-confine requires --channelised and --attach-socket" >&2
+    exit 2
+fi
+if (( (port_layout_seen || port_mask_seen) && !attach_socket_seen )); then
+    echo "unmoor-deaddrop-ssh: --port-layout/--port-mask require --attach-socket" >&2
+    exit 2
+fi
+if (( port_mask_seen )) && [[ "$port_layout" != cube ]]; then
+    echo "unmoor-deaddrop-ssh: --port-mask requires --port-layout=cube" >&2
+    exit 2
+fi
+if (( attach_socket_seen )) && [[ "$attach_socket" != /* ]]; then
+    echo "unmoor-deaddrop-ssh: --attach-socket PATH must be absolute" >&2
+    exit 2
+fi
+
+if (( multipath_bare )); then
+    if [[ "$traffic_profile" == enterprise ]]; then
+        bare_paths=2
+    else
+        bare_paths=8
+    fi
+    if (( multipath_exact )) && [[ "$multipath_exact" != "$bare_paths" ]]; then
+        echo "unmoor-deaddrop-ssh: conflicting resolved --multipath requests" >&2
+        exit 2
+    fi
+fi
+if [[ "$traffic_profile" == enterprise ]] &&
+   (( multipath_exact )) && (( multipath_exact != 2 )); then
+    echo "unmoor-deaddrop-ssh: enterprise terminal multipath requires 2 paths" >&2
+    exit 2
+fi
+
+[[ ${#ssh_args[@]} -gt 0 ]] || {
+    echo "unmoor-deaddrop-ssh: no SSH destination given" >&2
+    exit 2
+}
+[[ "$timeout_secs" =~ ^[0-9]+$ ]] &&
+    (( timeout_secs >= 1 && timeout_secs <= 3600 )) || {
+    echo "unmoor-deaddrop-ssh: --timeout must be 1..3600 seconds" >&2
+    exit 2
+}
+
+last=$((${#ssh_args[@]} - 1))
+target=${ssh_args[$last]}
+[[ -n "$udp_host" ]] || udp_host=${target#*@}
+
+if [[ -z "$local_bin" ]]; then
+    candidate="$(cd "$(dirname "$0")/.." && pwd)/unmoor"
+    if [[ -x "$candidate" ]]; then
+        local_bin=$candidate
+    elif command -v unmoor >/dev/null 2>&1; then
+        local_bin=unmoor
+    else
+        echo "unmoor-deaddrop-ssh: no local unmoor binary" >&2
+        exit 2
+    fi
+fi
+if [[ "$local_bin" == */* ]]; then
+    [[ -x "$local_bin" ]] || {
+        echo "unmoor-deaddrop-ssh: local binary is not executable: $local_bin" >&2
+        exit 2
+    }
+elif ! command -v "$local_bin" >/dev/null 2>&1; then
+    echo "unmoor-deaddrop-ssh: local command not found: $local_bin" >&2
+    exit 2
+fi
+"$local_bin" version >/dev/null 2>&1 || {
+    echo "unmoor-deaddrop-ssh: local binary failed version preflight" >&2
+    exit 2
+}
+
+# No key is produced in this shell, even under `bash -x`.
+local_args=(ssh-connect --udp-host "$udp_host" --remote "$remote_cmd" \
+    --timeout "$timeout_secs" --pq "$pq_policy")
+if [[ "$traffic_profile" != enterprise ]]; then
+    local_args+=(--profile "$traffic_profile")
+fi
+if [[ "$log_format" == json ]]; then
+    local_args+=(--log-format json)
+fi
+if [[ -n "$remote_bind_host" ]]; then
+    local_args+=(--remote-bind-host "$remote_bind_host")
+fi
+if (( remote_foreground )); then
+    local_args+=(--remote-foreground)
+fi
+if (( channelised )); then
+    local_args+=(--channelised)
+fi
+if (( attach_socket_seen )); then
+    local_args+=(--attach-socket "$attach_socket")
+fi
+if (( confine_seen )); then
+    local_args+=(--confine "$confine_level")
+fi
+if (( server_confine_seen )); then
+    local_args+=(--server-confine "$server_confine_level")
+fi
+if (( ${#confine_roots[@]} > 0 )); then
+    for confine_root in "${confine_roots[@]}"; do
+        local_args+=(--confine-root "$confine_root")
+    done
+fi
+if (( port_layout_seen )); then
+    local_args+=(--port-layout "$port_layout")
+fi
+if (( port_mask_seen )); then
+    local_args+=(--port-mask "$port_mask")
+fi
+if (( multipath_exact )); then
+    local_args+=("--multipath=$multipath_exact")
+elif (( multipath_bare )); then
+    local_args+=(--multipath)
+fi
+local_args+=(--)
+if (( last == 0 )); then
+    # Bash 3.2 under `set -u` treats expansion of an array whose sole element
+    # was unset as an unbound variable.  Keep the normal no-option path exact.
+    exec "$local_bin" "${local_args[@]}" "$target"
+else
+    unset 'ssh_args[$last]'
+    exec "$local_bin" "${local_args[@]}" "${ssh_args[@]}" "$target"
+fi

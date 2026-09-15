@@ -1,0 +1,12 @@
+/.build/
+/unmoor
+/unmoor-static
+/dist/
+/logs/
+/private/
+*.o
+*.d
+*.pyc
+__pycache__/
+.DS_Store
+*~

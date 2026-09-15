@@ -1,0 +1,64 @@
+# Copyright (c) 2026 Nenad Micic
+# SPDX-License-Identifier: Apache-2.0
+#
+# Minimal continuous integration: build the tree from scratch on Linux and
+# macOS, run the unit tests and hygiene checks, then run the loopback smoke
+# test, which starts a real post-quantum bootstrap and a real PTY over UDP on
+# the runner itself. Nothing here contacts a network host.
+
+name: build and test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: linux-gcc
+            cc: gcc
+          - os: ubuntu-latest
+            name: linux-clang
+            cc: clang
+          - os: macos-latest
+            name: macos-clang
+            cc: clang
+    env:
+      CC: ${{ matrix.cc }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: compiler version
+        run: ${{ matrix.cc }} --version
+
+      - name: build
+        run: make -j2
+
+      - name: unit tests, symbol hygiene, shell syntax
+        run: make check
+
+      - name: loopback smoke
+        run: make smoke
+
+      - name: source bundle builds and tests from a clean directory
+        run: |
+          set -eu
+          make bundle
+          mkdir -p "$RUNNER_TEMP/frombundle"
+          tar -xzf dist/unmoor-*.tar.gz -C "$RUNNER_TEMP/frombundle"
+          cd "$RUNNER_TEMP/frombundle/unmoor"
+          make -j2
+          make check
+          make smoke
