@@ -47,16 +47,12 @@ int pq_policy_valid(pq_policy_t policy)
 
 pq_probe_result_t pq_probe_classify(const uint8_t *stdout_bytes,
                                     size_t stdout_len,
-                                    const uint8_t *stderr_bytes,
-                                    size_t stderr_len,
                                     int exited, int exit_code)
 {
     static const uint8_t supported[] = PQ_PROBE_SUPPORTED_TEXT;
     static const uint8_t legacy[] = PQ_PROBE_LEGACY_TEXT;
 
-    if ((stdout_len != 0U && !stdout_bytes) ||
-        (stderr_len != 0U && !stderr_bytes) || stderr_len != 0U ||
-        exited != 1 || exit_code != 0)
+    if ((stdout_len != 0U && !stdout_bytes) || exited != 1 || exit_code != 0)
         return PQ_PROBE_ERROR;
     if (stdout_len == sizeof(supported) - 1U &&
         memcmp(stdout_bytes, supported, sizeof(supported) - 1U) == 0)

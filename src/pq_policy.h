@@ -38,12 +38,12 @@ int pq_policy_parse(const char *text, pq_policy_t *out);
 const char *pq_policy_name(pq_policy_t policy);
 int pq_policy_valid(pq_policy_t policy);
 
-/* A probe is positive only for one exact stdout tuple, empty stderr, and
- * ordinary exit zero. All other process/output shapes are errors. */
+/* A probe is positive only for one exact stdout tuple and ordinary exit
+ * zero. All other stdout/process shapes are errors. The probe's stderr is
+ * not an input: the initiator leaves it inherited, so an sshd banner or any
+ * OpenSSH diagnostic stays visible to the operator and never decides. */
 pq_probe_result_t pq_probe_classify(const uint8_t *stdout_bytes,
                                     size_t stdout_len,
-                                    const uint8_t *stderr_bytes,
-                                    size_t stderr_len,
                                     int exited, int exit_code);
 
 #endif /* UNMOOR_PQ_POLICY_H */

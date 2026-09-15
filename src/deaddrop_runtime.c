@@ -2429,9 +2429,11 @@ static int build_remote_command(const d28_ssh_connect_config_t *config,
     return count > 0 && count < PATH_MAX ? 0 : -1;
 }
 
-static pid_t spawn_argv_capture(char *const arguments[],
-                                int to_child[2], int from_child[2],
-                                int error_child[2])
+/* Every carrier child, including the feature probe, keeps the parent's
+ * stderr: OpenSSH prints its pre-authentication banner and diagnostics
+ * there, and they belong to the operator rather than to a captured stream. */
+static pid_t spawn_argv(char *const arguments[],
+                        int to_child[2], int from_child[2])
 {
     pid_t pid;
 
@@ -2440,17 +2442,12 @@ static pid_t spawn_argv_capture(char *const arguments[],
     if (pid == 0) {
         process_reset_child_signals();
         if (dup2(to_child[0], STDIN_FILENO) < 0 ||
-            dup2(from_child[1], STDOUT_FILENO) < 0 ||
-            (error_child && dup2(error_child[1], STDERR_FILENO) < 0))
+            dup2(from_child[1], STDOUT_FILENO) < 0)
             _exit(126);
         (void)close(to_child[0]);
         (void)close(to_child[1]);
         (void)close(from_child[0]);
         (void)close(from_child[1]);
-        if (error_child) {
-            (void)close(error_child[0]);
-            (void)close(error_child[1]);
-        }
         if (process_close_from(STDERR_FILENO + 1, NULL, 0U) != 0)
             _exit(126);
         execvp(arguments[0], arguments);
@@ -2459,12 +2456,6 @@ static pid_t spawn_argv_capture(char *const arguments[],
         _exit(127);
     }
     return pid;
-}
-
-static pid_t spawn_argv(char *const arguments[],
-                        int to_child[2], int from_child[2])
-{
-    return spawn_argv_capture(arguments, to_child, from_child, NULL);
 }
 
 static pid_t spawn_ssh(const d28_ssh_connect_config_t *config,
@@ -2486,62 +2477,35 @@ static pid_t spawn_ssh(const d28_ssh_connect_config_t *config,
     arguments[output++] = config->ssh_argv[config->ssh_argc - 1];
     arguments[output++] = (char *)remote_command;
     arguments[output] = NULL;
-    pid = spawn_argv_capture(arguments, to_child, from_child, NULL);
-    free(arguments);
-    return pid;
-}
-
-static pid_t spawn_ssh_capture(const d28_ssh_connect_config_t *config,
-                               const char *remote_command,
-                               int to_child[2], int from_child[2],
-                               int error_child[2])
-{
-    char **arguments;
-    pid_t pid;
-    int i;
-    int output = 0;
-
-    arguments = calloc((size_t)config->ssh_argc + 5U, sizeof(*arguments));
-    if (!arguments)
-        return -1;
-    arguments[output++] = (char *)"ssh";
-    for (i = 0; i + 1 < config->ssh_argc; i++)
-        arguments[output++] = config->ssh_argv[i];
-    arguments[output++] = (char *)"--";
-    arguments[output++] = config->ssh_argv[config->ssh_argc - 1];
-    arguments[output++] = (char *)remote_command;
-    arguments[output] = NULL;
-    pid = spawn_argv_capture(arguments, to_child, from_child, error_child);
+    pid = spawn_argv(arguments, to_child, from_child);
     free(arguments);
     return pid;
 }
 
 #define D45_PROBE_OUTPUT_MAX 128U
 
-static int capture_probe_streams(int stdout_fd, int stderr_fd,
-                                 uint8_t stdout_bytes[D45_PROBE_OUTPUT_MAX],
-                                 size_t *stdout_len,
-                                 uint8_t stderr_bytes[D45_PROBE_OUTPUT_MAX],
-                                 size_t *stderr_len,
-                                 int64_t deadline_ms)
+/* Only the probe's stdout is captured, one byte at a time, within the fixed
+ * bound.  Its stderr is inherited, so a banner or diagnostic of any length
+ * neither consumes this bound nor waits on a pipe this process must drain. */
+static int capture_probe_stdout(int stdout_fd,
+                                uint8_t stdout_bytes[D45_PROBE_OUTPUT_MAX],
+                                size_t *stdout_len, int64_t deadline_ms)
 {
-    struct pollfd streams[2];
-    size_t lengths[2] = { 0U, 0U };
-    uint8_t *outputs[2] = { stdout_bytes, stderr_bytes };
-    int active = 2;
+    struct pollfd stream;
+    size_t length = 0U;
 
-    if (!stdout_len || !stderr_len)
+    if (!stdout_len)
         return -1;
-    memset(streams, 0, sizeof(streams));
-    streams[0].fd = stdout_fd;
-    streams[1].fd = stderr_fd;
-    streams[0].events = POLLIN;
-    streams[1].events = POLLIN;
-    while (active > 0) {
+    memset(&stream, 0, sizeof(stream));
+    stream.fd = stdout_fd;
+    stream.events = POLLIN;
+    for (;;) {
         int64_t now = monotonic_ms();
         int64_t remaining;
         int timeout;
         int ready;
+        uint8_t byte;
+        ssize_t count;
 
         if (runtime_stop || now < 0)
             return -1;
@@ -2551,7 +2515,7 @@ static int capture_probe_streams(int stdout_fd, int stderr_fd,
             return -1;
         }
         timeout = remaining > INT_MAX ? INT_MAX : (int)remaining;
-        ready = poll(streams, 2, timeout);
+        ready = poll(&stream, 1, timeout);
         if (ready < 0 && errno == EINTR)
             continue;
         if (ready <= 0) {
@@ -2559,32 +2523,21 @@ static int capture_probe_streams(int stdout_fd, int stderr_fd,
                 errno = ETIMEDOUT;
             return -1;
         }
-        for (size_t index = 0U; index < 2U; index++) {
-            uint8_t byte;
-            ssize_t count;
-
-            if (streams[index].fd < 0 || streams[index].revents == 0)
+        count = read(stream.fd, &byte, 1U);
+        if (count == 0)
+            break;
+        if (count < 0) {
+            if (errno == EINTR)
                 continue;
-            count = read(streams[index].fd, &byte, 1U);
-            if (count == 0) {
-                streams[index].fd = -1;
-                active--;
-                continue;
-            }
-            if (count < 0) {
-                if (errno == EINTR)
-                    continue;
-                return -1;
-            }
-            if (lengths[index] >= D45_PROBE_OUTPUT_MAX) {
-                errno = EOVERFLOW;
-                return -1;
-            }
-            outputs[index][lengths[index]++] = byte;
+            return -1;
         }
+        if (length >= D45_PROBE_OUTPUT_MAX) {
+            errno = EOVERFLOW;
+            return -1;
+        }
+        stdout_bytes[length++] = byte;
     }
-    *stdout_len = lengths[0];
-    *stderr_len = lengths[1];
+    *stdout_len = length;
     return 0;
 }
 
@@ -2593,11 +2546,8 @@ static pq_probe_result_t run_ssh_pq_probe(
 {
     int to_probe[2] = { -1, -1 };
     int from_probe[2] = { -1, -1 };
-    int error_probe[2] = { -1, -1 };
     uint8_t stdout_bytes[D45_PROBE_OUTPUT_MAX];
-    uint8_t stderr_bytes[D45_PROBE_OUTPUT_MAX];
     size_t stdout_len = 0U;
-    size_t stderr_len = 0U;
     char command[PATH_MAX];
     pid_t child = -1;
     int status = 0;
@@ -2605,15 +2555,14 @@ static pq_probe_result_t run_ssh_pq_probe(
     pq_probe_result_t result = PQ_PROBE_ERROR;
 
     memset(stdout_bytes, 0, sizeof(stdout_bytes));
-    memset(stderr_bytes, 0, sizeof(stderr_bytes));
     if (!config || !valid_remote_command(config->remote_command) ||
         snprintf(command, sizeof(command), "%s version --pq-probe",
                  config->remote_command) <= 0 ||
-        pipe_cloexec(to_probe) != 0 || pipe_cloexec(from_probe) != 0 ||
-        pipe_cloexec(error_probe) != 0)
+        pipe_cloexec(to_probe) != 0 || pipe_cloexec(from_probe) != 0)
         goto cleanup;
-    child = spawn_ssh_capture(config, command, to_probe, from_probe,
-                              error_probe);
+    /* The same spawn as the bootstrap carrier: stdin and stdout piped,
+     * stderr inherited.  Exact stdout and exit status decide the result. */
+    child = spawn_ssh(config, command, to_probe, from_probe);
     if (child < 0)
         goto cleanup;
     runtime_child_pid = child;
@@ -2623,11 +2572,8 @@ static pq_probe_result_t run_ssh_pq_probe(
     to_probe[1] = -1;
     (void)close(from_probe[1]);
     from_probe[1] = -1;
-    (void)close(error_probe[1]);
-    error_probe[1] = -1;
-    if (capture_probe_streams(from_probe[0], error_probe[0], stdout_bytes,
-                              &stdout_len, stderr_bytes, &stderr_len,
-                              deadline_ms) != 0)
+    if (capture_probe_stdout(from_probe[0], stdout_bytes, &stdout_len,
+                             deadline_ms) != 0)
         goto cleanup;
     {
         int64_t remaining = deadline_ms - monotonic_ms();
@@ -2641,7 +2587,7 @@ static pq_probe_result_t run_ssh_pq_probe(
     child = -1;
     runtime_child_pid = 0;
     result = pq_probe_classify(
-        stdout_bytes, stdout_len, stderr_bytes, stderr_len,
+        stdout_bytes, stdout_len,
         WIFEXITED(status) ? 1 : 0,
         WIFEXITED(status) ? WEXITSTATUS(status) : 0);
 
@@ -2654,15 +2600,10 @@ cleanup:
         (void)close(from_probe[0]);
     if (from_probe[1] >= 0)
         (void)close(from_probe[1]);
-    if (error_probe[0] >= 0)
-        (void)close(error_probe[0]);
-    if (error_probe[1] >= 0)
-        (void)close(error_probe[1]);
     if (child > 0)
         (void)terminate_and_reap(child);
     runtime_child_pid = 0;
     crypto_memzero(stdout_bytes, sizeof(stdout_bytes));
-    crypto_memzero(stderr_bytes, sizeof(stderr_bytes));
     crypto_memzero(command, sizeof(command));
     return result;
 }
