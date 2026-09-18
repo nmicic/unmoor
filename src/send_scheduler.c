@@ -22,6 +22,7 @@ static void charge_current_copy_once(send_scheduler_t *sched)
         return;
     if (sched->rate_bps > 0)
         sched->credit_milli -= sched->frame_cost_milli;
+    sched->charged_copies++;
     sched->current_copy_charged = 1;
     sched->in_flight_charged = 1;
 }

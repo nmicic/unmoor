@@ -66,6 +66,13 @@ typedef struct {
     uint64_t physical_would_block;
     uint64_t physical_partial;
     uint64_t physical_skipped;
+    /* Physical copies that consumed their one packet-equivalent charge.  The
+     * charged byte total is `charged_copies * frame_cost_milli / 1000`, which
+     * is what makes a capture comparable to fixed-rate pacing: the wire shows
+     * a 204-byte probe, the pacer spent a full packet-equivalent on it.  With
+     * `rate_bps == 0` the pacing claim is disabled and no credit is actually
+     * debited, so the figure there is what pacing would have cost. */
+    uint64_t charged_copies;
 
     uint8_t next_lane;
     uint8_t turn_used;

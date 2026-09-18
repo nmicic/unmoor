@@ -88,6 +88,18 @@ typedef struct transport_stats {
     uint32_t  tx_fail;
     uint32_t  rx_ok;
     uint32_t  rx_drop;
+    /* Datagram accounting for packet-capture reconciliation.  A would-block is
+     * not a failure: the frame is retained and reattempted, so it is counted
+     * apart from tx_fail rather than folded into it.  Byte counts are frame
+     * bytes, which on UDP is the complete datagram payload and therefore
+     * excludes the IP/UDP headers a capture also sees - a reconciliation has
+     * to add those itself rather than find them silently included here.  The
+     * stream transports count the same frame bytes and so exclude their own
+     * 2-byte length prefix, which has no UDP counterpart. */
+    uint32_t  tx_would_block;
+    uint32_t  tx_too_large;    /* EMSGSIZE; a diagnostic, never authority */
+    uint64_t  tx_bytes;        /* bytes of completed frames only */
+    uint64_t  rx_bytes;        /* bytes of accepted frames only */
     int16_t   rssi_last;       /* dBm, INT16_MIN if unknown */
     int8_t    snr_last;        /* tenths of dB, INT8_MIN if unknown */
     uint8_t   transport_id;   /* 0=unix, 2=stdio, 3=udp */

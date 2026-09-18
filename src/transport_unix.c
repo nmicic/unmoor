@@ -367,6 +367,7 @@ static int unix_send(transport_t *base, const uint8_t *data, size_t len)
         return -1;
     }
     t->stats.tx_ok++;
+    t->stats.tx_bytes += (uint64_t)len;
     return 0;
 }
 
@@ -376,9 +377,10 @@ static int unix_send_step(transport_t *base,
     transport_unix_t *t = (transport_unix_t *)base;
     int rc = transport_stream_tx_step(&t->tx, data, len,
                                       unix_write_step, t);
-    if (rc == TRANSPORT_SEND_COMPLETE)
+    if (rc == TRANSPORT_SEND_COMPLETE) {
         t->stats.tx_ok++;
-    else if (rc == TRANSPORT_SEND_FAILED) {
+        t->stats.tx_bytes += (uint64_t)len;
+    } else if (rc == TRANSPORT_SEND_FAILED) {
         int saved_errno = errno;
 
         if (saved_errno == EPIPE)
@@ -445,6 +447,7 @@ static int unix_recv(transport_t *base, uint8_t *buf, size_t max, int timeout_ms
         return -1;
     }
     t->stats.rx_ok++;
+    t->stats.rx_bytes += (uint64_t)body_len;
     return (int)body_len;
 }
 

@@ -500,7 +500,6 @@ static void session_event_emit(session_t *s, event_log_event_t event,
                                uint64_t generation, int64_t now_ms);
 static void session_event_latch_close_reason(session_t *s,
                                              event_log_reason_t reason);
-static int session_async_terminal_text_suppressed(const session_t *s);
 
 static send_mode_t wire_mode(const session_t *s)
 {
@@ -5911,7 +5910,7 @@ static int session_status_counters(const session_t *s,
     return 0;
 }
 
-static int session_async_terminal_text_suppressed(const session_t *s)
+int session_async_terminal_text_suppressed(const session_t *s)
 {
     return s && s->raw_mode_active && s->shared_raw_display_tty;
 }
@@ -6253,10 +6252,92 @@ static void session_diagnostic_line(session_diagnostic_writer_t *writer,
         writer->dropped++;
 }
 
+/* Aggregate view of the send-side DATA gate across live instances.  Reason
+ * is the union of what is currently shut, `closed_ms` the oldest still-open
+ * close, and `frontier_age_ms` the worst delivery age: a reader chasing a
+ * stall wants the instance that is furthest behind, not an average that
+ * hides it. */
+typedef struct {
+    uint32_t closes;
+    uint32_t opens;
+    unsigned reason;
+    int64_t  closed_ms;
+    int64_t  paused_ms;
+    int64_t  frontier_age_ms;
+    unsigned instances;
+    /* Read-side gate at the instant of the snapshot: the union of what is
+     * shut now, and the oldest still-open quota close.  Separate from
+     * `reason`, which describes the send-side DATA gate. */
+    unsigned source_gate;
+    int64_t  source_blocked_open_ms;
+} session_diagnostic_gate_t;
+
+static void session_diagnostic_fold_tx(const sync_tx_t *tx, int64_t now_ms,
+                                       sync_tx_stats_t *stats,
+                                       session_diagnostic_gate_t *gate)
+{
+    unsigned i;
+
+    for (i = 0U; i < SYNC_TX_CLASS_COUNT; i++) {
+        stats->attempts[i] += tx->stats.attempts[i];
+        stats->completed[i] += tx->stats.completed[i];
+        stats->failed[i] += tx->stats.failed[i];
+        stats->payload_attempted[i] += tx->stats.payload_attempted[i];
+        stats->payload_completed[i] += tx->stats.payload_completed[i];
+    }
+    for (i = 0U; i < SYNC_SIZE_BUCKETS; i++)
+        stats->size_bucket[i] += tx->stats.size_bucket[i];
+    for (i = 0U; i < SYNC_SHORT_COUNT; i++)
+        stats->short_reason[i] += tx->stats.short_reason[i];
+    stats->at_ceiling += tx->stats.at_ceiling;
+    stats->near_ceiling += tx->stats.near_ceiling;
+    stats->source_blocked_closes += tx->stats.source_blocked_closes;
+    stats->source_blocked_opens += tx->stats.source_blocked_opens;
+    stats->source_blocked_ms += tx->stats.source_blocked_ms;
+    stats->cliff_arms += tx->stats.cliff_arms;
+    stats->cliff_repair_attempts += tx->stats.cliff_repair_attempts;
+    stats->cliff_repair_completed += tx->stats.cliff_repair_completed;
+    stats->cliff_repair_payload += tx->stats.cliff_repair_payload;
+    stats->bitmap_repair_attempts += tx->stats.bitmap_repair_attempts;
+    stats->bitmap_repair_completed += tx->stats.bitmap_repair_completed;
+    stats->bitmap_repair_payload += tx->stats.bitmap_repair_payload;
+    /* Peak occupancy is per instance, so the fold reports the worst one; a
+     * sum would invent an occupancy no single backlog ever held. */
+    if (tx->stats.retained_peak > stats->retained_peak)
+        stats->retained_peak = tx->stats.retained_peak;
+    gate->source_gate |= tx->gate_state;
+    if (tx->source_blocked_since_ms != 0 &&
+        now_ms > tx->source_blocked_since_ms &&
+        now_ms - tx->source_blocked_since_ms > gate->source_blocked_open_ms)
+        gate->source_blocked_open_ms = now_ms - tx->source_blocked_since_ms;
+    if (tx->stats.max_payload > stats->max_payload)
+        stats->max_payload = tx->stats.max_payload;
+    if (tx->stats.last_ceiling > stats->last_ceiling)
+        stats->last_ceiling = tx->stats.last_ceiling;
+
+    gate->instances++;
+    gate->closes += tx->data_gate_closes;
+    gate->opens += tx->data_gate_opens;
+    gate->paused_ms += tx->data_gate_paused_ms;
+    if (tx->data_gate_closed_ms != 0) {
+        gate->reason |= tx->data_gate_reason;
+        if (gate->closed_ms == 0 || tx->data_gate_closed_ms < gate->closed_ms)
+            gate->closed_ms = tx->data_gate_closed_ms;
+    }
+    if (tx->last_frontier_ms > 0 && now_ms > tx->last_frontier_ms) {
+        int64_t age = now_ms - tx->last_frontier_ms;
+
+        if (age > gate->frontier_age_ms)
+            gate->frontier_age_ms = age;
+    }
+}
+
 int session_diagnostic_snapshot(session_t *s, int fd,
                                 uint64_t snapshot_id, int64_t now_ms)
 {
     session_diagnostic_writer_t writer;
+    sync_tx_stats_t tx_stats;
+    session_diagnostic_gate_t gate;
     multipath_snapshot_t paths;
     transport_stats_t transport_stats;
     uint16_t local_ports[MULTIPATH_PATHS_MAX];
@@ -6296,6 +6377,8 @@ int session_diagnostic_snapshot(session_t *s, int fd,
 
     memset(&paths, 0, sizeof(paths));
     memset(&transport_stats, 0, sizeof(transport_stats));
+    memset(&tx_stats, 0, sizeof(tx_stats));
+    memset(&gate, 0, sizeof(gate));
     memset(local_ports, 0, sizeof(local_ports));
     memset(local_families, 0, sizeof(local_families));
     if (s->transport && s->transport->ops) {
@@ -6371,6 +6454,7 @@ int session_diagnostic_snapshot(session_t *s, int fd,
                 rx_frontier = event_counter_add(rx_frontier, rx->frontier);
                 rx_pending = event_counter_add(
                     rx_pending, (uint64_t)rx->ring_size);
+                session_diagnostic_fold_tx(tx, now_ms, &tx_stats, &gate);
             }
         } else {
             tx_base = s->sync_tx.base;
@@ -6379,6 +6463,9 @@ int session_diagnostic_snapshot(session_t *s, int fd,
             tx_quota = s->sync_tx.quota;
             rx_frontier = s->sync_rx.frontier;
             rx_pending = (uint64_t)s->sync_rx.ring_size;
+            if (s->sync_tx.active)
+                session_diagnostic_fold_tx(&s->sync_tx, now_ms, &tx_stats,
+                                           &gate);
         }
 
         sync_status_snapshot(&tracker, now_ms, tx_tip, rx_delivered,
@@ -6391,19 +6478,172 @@ int session_diagnostic_snapshot(session_t *s, int fd,
             " tx-quota=%" PRIu64 " rx-delivered=%" PRIu64
             " rx-frontier=%" PRIu64 " rx-highest=%" PRIu64
             " rx-pending=%zu sink-blocked=%d behind-known=%d "
-            "out-behind=%" PRIu64 " in-behind=%" PRIu64,
+            "out-behind=%" PRIu64 " in-behind=%" PRIu64
+            /* Per-direction progress ages, so a STALLED line says which side
+             * of the stream stopped.  -1 means that direction has nothing
+             * outstanding and so has nothing to be late for; stall-dirs is
+             * zero when the stall is a path-liveness failure rather than one
+             * direction falling behind. */
+            " out-progress-age-ms=%" PRId64 " in-progress-age-ms=%" PRId64
+            " stall-dirs=0x%02x",
             snapshot_id, sync_status_state_name(view.state),
             tx_base, tx_tip, tx_sent,
             tx_credit, tx_quota, rx_delivered,
             rx_frontier, rx_highest, (size_t)rx_pending,
             sink_blocked, view.behind_known, view.outgoing_behind,
-            view.incoming_behind);
+            view.incoming_behind, view.outgoing_progress_age_ms,
+            view.incoming_progress_age_ms, view.stalled_directions);
         have_sync = 1;
     }
     if (!have_sync)
         session_diagnostic_line(
             &writer, "unmoor: diagnostic id=%" PRIu64
             " sync=inactive", snapshot_id);
+
+    if (gate.instances > 0U) {
+        static const char *const class_name[SYNC_TX_CLASS_COUNT] = {
+            "new", "repair", "probe"
+        };
+        unsigned int cls;
+        unsigned int first;
+
+        for (cls = 0U; cls < SYNC_TX_CLASS_COUNT; cls++)
+            session_diagnostic_line(
+                &writer,
+                "unmoor: diagnostic id=%" PRIu64 " data class=%s "
+                "attempts=%" PRIu64 " completed=%" PRIu64
+                " failed=%" PRIu64 " payload-attempted=%" PRIu64
+                " payload-completed=%" PRIu64,
+                snapshot_id, class_name[cls], tx_stats.attempts[cls],
+                tx_stats.completed[cls], tx_stats.failed[cls],
+                tx_stats.payload_attempted[cls],
+                tx_stats.payload_completed[cls]);
+
+        /* The one recovery class, split by the producer that asked for it.
+         * Every sync payload travels inside the AEAD, so a packet capture can
+         * measure datagrams and their sizes but can never say which bytes were
+         * first transmissions: the class totals alone leave the network
+         * account of a catch-up unfalsifiable.  Bitmap repair names blocks the
+         * peer reported missing; cliff repair names an extent the peer's ack
+         * grammar has no way to report at all, and is the only line that
+         * carries a deliberate duplicate.  The two sums reconcile exactly with
+         * the repair row above, which is what makes a capture checkable
+         * against the product rather than reverse-engineered from it. */
+        session_diagnostic_line(
+            &writer,
+            "unmoor: diagnostic id=%" PRIu64 " data-repair "
+            "bitmap-attempts=%" PRIu64 " bitmap-completed=%" PRIu64
+            " bitmap-payload=%" PRIu64 " cliff-attempts=%" PRIu64
+            " cliff-completed=%" PRIu64 " cliff-payload=%" PRIu64
+            " cliff-arms=%" PRIu64,
+            snapshot_id, tx_stats.bitmap_repair_attempts,
+            tx_stats.bitmap_repair_completed, tx_stats.bitmap_repair_payload,
+            tx_stats.cliff_repair_attempts, tx_stats.cliff_repair_completed,
+            tx_stats.cliff_repair_payload, tx_stats.cliff_arms);
+
+        /* The histogram is emitted in fixed groups of eight so one line can
+         * never be truncated by a long run of large counts; a dropped line
+         * would be counted as dropped, but the reconciliation would still be
+         * missing the buckets it needed. */
+        for (first = 0U; first < SYNC_SIZE_BUCKETS; first += 8U) {
+            char counts[8U * 24U];
+            size_t used = 0U;
+            unsigned int i;
+
+            counts[0] = '\0';
+            for (i = first; i < first + 8U && i < SYNC_SIZE_BUCKETS; i++) {
+                int n = snprintf(counts + used, sizeof(counts) - used,
+                                 "%s%" PRIu64, i == first ? "" : ",",
+                                 tx_stats.size_bucket[i]);
+
+                if (n < 0 || (size_t)n >= sizeof(counts) - used)
+                    break;
+                used += (size_t)n;
+            }
+            session_diagnostic_line(
+                &writer,
+                "unmoor: diagnostic id=%" PRIu64 " data-size from=%u "
+                "step=%u counts=%s",
+                snapshot_id, first, (unsigned int)SYNC_SIZE_BUCKET_BYTES,
+                counts);
+        }
+        session_diagnostic_line(
+            &writer,
+            "unmoor: diagnostic id=%" PRIu64 " data-size ceiling=%u "
+            "max=%u at-ceiling=%" PRIu64 " near-ceiling=%" PRIu64,
+            snapshot_id, (unsigned int)tx_stats.last_ceiling,
+            (unsigned int)tx_stats.max_payload, tx_stats.at_ceiling,
+            tx_stats.near_ceiling);
+        session_diagnostic_line(
+            &writer,
+            "unmoor: diagnostic id=%" PRIu64 " data-short full=%" PRIu64
+            " tail=%" PRIu64 " credit=%" PRIu64 " sink=%" PRIu64
+            " bitmap=%" PRIu64 " repair-tail=%" PRIu64 " probe=%" PRIu64
+            " other=%" PRIu64,
+            snapshot_id,
+            tx_stats.short_reason[SYNC_SHORT_NONE],
+            tx_stats.short_reason[SYNC_SHORT_TAIL],
+            tx_stats.short_reason[SYNC_SHORT_CREDIT],
+            tx_stats.short_reason[SYNC_SHORT_SINK],
+            tx_stats.short_reason[SYNC_SHORT_BITMAP],
+            tx_stats.short_reason[SYNC_SHORT_REPAIR_TAIL],
+            tx_stats.short_reason[SYNC_SHORT_PROBE],
+            tx_stats.short_reason[SYNC_SHORT_OTHER]);
+        session_diagnostic_line(
+            &writer,
+            "unmoor: diagnostic id=%" PRIu64 " data-gate instances=%u "
+            "closes=%" PRIu32 " opens=%" PRIu32 " reason=0x%02x "
+            "closed-ms=%" PRId64 " paused-ms=%" PRId64
+            " frontier-age-ms=%" PRId64 " source-blocked-closes=%" PRIu32
+            " source-blocked-opens=%" PRIu32,
+            snapshot_id, gate.instances, gate.closes, gate.opens,
+            gate.reason,
+            gate.closed_ms != 0 && now_ms > gate.closed_ms
+                ? now_ms - gate.closed_ms : (int64_t)0,
+            gate.paused_ms, gate.frontier_age_ms,
+            tx_stats.source_blocked_closes, tx_stats.source_blocked_opens);
+        /* This reports the full-buffer state itself, not a guess from
+         * elapsed time.  `retained-peak` against the `tx-quota` on the sync
+         * line says whether the cap was met and whether anything got past it;
+         * `source-blocked` says whether the source is backpressured at this
+         * instant; the two millisecond figures separate intervals that have
+         * closed from the one still open, so a reader never has to assume a
+         * gate that is shut now was shut for the whole window. */
+        session_diagnostic_line(
+            &writer,
+            "unmoor: diagnostic id=%" PRIu64 " data-quota retained-peak=%"
+            PRIu64 " source-blocked=%d credit-blocked=%d"
+            " source-blocked-ms=%" PRId64 " source-blocked-open-ms=%" PRId64,
+            snapshot_id, tx_stats.retained_peak,
+            (gate.source_gate & 1U) != 0U, (gate.source_gate & 2U) != 0U,
+            tx_stats.source_blocked_ms, gate.source_blocked_open_ms);
+    }
+
+    session_diagnostic_line(
+        &writer,
+        "unmoor: diagnostic id=%" PRIu64 " wire rate-bps=%" PRId64
+        " frame-charge=%" PRId64 " charged-frames=%" PRIu64
+        " charged-bytes=%" PRIu64 " would-block=%" PRIu64
+        " partial=%" PRIu64 " phys-attempted=%" PRIu64
+        " phys-completed=%" PRIu64 " phys-failed=%" PRIu64,
+        snapshot_id, s->wire_scheduler.rate_bps,
+        s->wire_scheduler.frame_cost_milli / 1000,
+        s->wire_scheduler.charged_copies,
+        (uint64_t)(s->wire_scheduler.charged_copies *
+                   (uint64_t)(s->wire_scheduler.frame_cost_milli / 1000)),
+        s->wire_scheduler.would_block, s->wire_scheduler.partial_progress,
+        s->wire_scheduler.physical_attempted,
+        s->wire_scheduler.physical_completed,
+        s->wire_scheduler.physical_failed);
+
+    if (have_transport_stats)
+        session_diagnostic_line(
+            &writer,
+            "unmoor: diagnostic id=%" PRIu64 " io-bytes tx-bytes=%" PRIu64
+            " rx-bytes=%" PRIu64 " tx-would-block=%" PRIu32
+            " tx-too-large=%" PRIu32,
+            snapshot_id, transport_stats.tx_bytes, transport_stats.rx_bytes,
+            transport_stats.tx_would_block, transport_stats.tx_too_large);
 
     if (have_paths) {
         session_diagnostic_line(
@@ -16425,6 +16665,21 @@ int session_run(session_t *s)
         if (s->state == SESSION_CLOSING && session_close_tick(s, now))
             continue;
 
+        /* ---- Sync deadline, re-read after the wire turn ----
+         * The deadline computed above ran before wire_drive_turn(), so every
+         * producer that self-gates on its own in-flight frame reported "not
+         * due" for a frame this same turn was about to make terminal. Sync
+         * repair is the one producer with a multi-frame per-ack grant, so it
+         * is the one that loses work: it would sleep until the next ack with
+         * grant still in hand. Ask again now that the turn is terminal. The
+         * answer is still the producer's own — nothing here weakens the
+         * admission test, it is only asked at a moment when it can be true. */
+        if (s->state == SESSION_ESTABLISHED &&
+            (sync_active(s) || session_channelised_active(s))) {
+            int64_t swait = sync_next_deadline(s, now);
+            if (swait >= 0 && swait < poll_ms) poll_ms = (int)swait;
+        }
+
         {
             int64_t wwait = send_scheduler_next_deadline(
                 &s->wire_scheduler, wire_eligible_mask(s, now),
@@ -16788,7 +17043,42 @@ int session_run(session_t *s)
 
             int pr = poll(pfds, (nfds_t)nfds, poll_ms);
             if (pr < 0) {
-                if (errno == EINTR) { errno = 0; continue; }
+                if (errno == EINTR) {
+                    errno = 0;
+                    /* Service the tick before restarting the poll. `continue`
+                     * jumps over the tick at the tail of this body, so a
+                     * signal that interrupts poll used to wait for a *fresh*
+                     * full poll_ms before it was answered -- being
+                     * interrupted was worse than not being interrupted, since
+                     * without EINTR the flag is seen at whatever is left of
+                     * the current timeout and with it the clock restarts from
+                     * zero. MN-B4-6 above anticipated up to 100 ms of tail
+                     * latency here and attributed it to the post-poll check;
+                     * the restart made it a near-constant 100 ms instead.
+                     * Measured on an idle endpoint: 20 signals at 101.5-104.8
+                     * ms, mean 102.7, before this line; 0.2-0.7 ms, mean 0.3,
+                     * after it. The spread is the tell -- a wait that
+                     * depended on the signal's arrival phase would be spread
+                     * across the band, and a constant full timeout is what a
+                     * restarted poll produces.
+                     *
+                     * This is a correctness fix for two measurements, not a
+                     * latency preference. The drain-capture window is placed
+                     * from these answers and is quiet at both edges by
+                     * construction, so the placement bracket was wide exactly
+                     * where the reconciliation needs it tight; and
+                     * `carriage_covers_delivery` compares two endpoints'
+                     * counters from one request, so a 100 ms skew between
+                     * their replies let delivery be read after carriage while
+                     * bytes were still moving. `tools/signal_latency_test.py`
+                     * holds the bound. The tick is the same call the tail of
+                     * the loop makes and it is reached with the body having
+                     * done nothing, so it sees the state the previous
+                     * iteration left -- which is the state that call already
+                     * ran against. */
+                    if (session_run_tick) session_run_tick(s);
+                    continue;
+                }
                 fprintf(stderr, "session: poll: %s — closing\n", strerror(errno));
                 session_transport_closed(s);
                 channel_close_all(s);

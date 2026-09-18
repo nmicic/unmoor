@@ -42,6 +42,18 @@ typedef enum {
     SYNC_STATUS_STALLED     = 2,
 } sync_status_state_t;
 
+/* OUTGOING is what the peer has confirmed receiving from us; INCOMING is what
+ * we have delivered from the peer.  The two are tracked separately so neither
+ * can vouch for the other. */
+#define SYNC_STATUS_DIR_OUTGOING 0U
+#define SYNC_STATUS_DIR_INCOMING 1U
+#define SYNC_STATUS_DIR_COUNT    2U
+
+/* Bit per direction, reported in the view so a reader learns which side of
+ * the stream stopped rather than only that something did. */
+#define SYNC_STATUS_STALL_OUTGOING 0x01U
+#define SYNC_STATUS_STALL_INCOMING 0x02U
+
 typedef struct {
     int      active;
     uint32_t epoch;
@@ -62,7 +74,20 @@ typedef struct {
     uint64_t previous_behind;
     int      previous_behind_known;
     int64_t  behind_since_ms;
-    int64_t  last_delivery_progress_ms;
+
+    /* Delivery progress is tracked per direction, because one fused anchor
+     * lets a healthy direction conceal a dead one: while the peer streams
+     * output we deliver locally, the outgoing anchor would keep being
+     * refreshed by incoming progress and an unacknowledged uplink would never
+     * read as stalled.  OUTGOING advances only when the peer's absolute
+     * rx_delivered grows (it received our bytes); INCOMING advances only when
+     * our own rx_delivered grows (we delivered the peer's).  A bare heartbeat
+     * moves neither.  `behind_since_ms` is likewise per direction, so a
+     * freshly opened backlog starts its own clock rather than inheriting a
+     * stale anchor from the other side of the stream. */
+    uint64_t previous_direction_behind[SYNC_STATUS_DIR_COUNT];
+    int64_t  direction_behind_since_ms[SYNC_STATUS_DIR_COUNT];
+    int64_t  last_direction_progress_ms[SYNC_STATUS_DIR_COUNT];
 
     sync_status_state_t state;
     int      state_announced;
@@ -82,6 +107,16 @@ typedef struct {
     int64_t  peer_snapshot_age_ms; /* -1 until the first valid snapshot */
     int64_t  last_sync_age_ms;     /* -1 until bilateral sync was proven */
     int64_t  stalled_age_ms;
+    /* Age of each direction's own delivery-progress anchor, or -1 when that
+     * direction is not behind and so has nothing outstanding to be late.
+     * `stalled_directions` is the union of the bits above for the directions
+     * actually over the stall threshold; it is zero whenever the state is not
+     * STALLED, and when the state is STALLED only because authentication went
+     * quiet it stays zero as well - that is a path-liveness failure, not one
+     * direction of the stream falling behind. */
+    int64_t  outgoing_progress_age_ms;
+    int64_t  incoming_progress_age_ms;
+    unsigned stalled_directions;
 } sync_status_view_t;
 
 int sync_status_record_encode(const sync_status_record_t *record,

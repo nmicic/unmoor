@@ -59,6 +59,16 @@ struct session;
 #define SYNC_ACK_REPEAT_MS     100
 #define SYNC_RTO_MIN_MS        200
 #define SYNC_RTO_MAX_MS        5000
+/* Grace before the send-side DATA gate closes.  Numerically equal to the
+ * status tracker's stall threshold so an operator never sees paused DATA while
+ * the status line still reads healthy, but deliberately a separate constant:
+ * that one is a UI label threshold and retuning it must not retune the wire.
+ * The floor is set by the retransmit ladder, not by the UI.  From
+ * SYNC_RTO_MIN_MS doubling to SYNC_RTO_MAX_MS, probes fire at 200, 600, 1400,
+ * 3000, 6200, 11200 ms, so the backoff only saturates at 6200 ms.  A shorter
+ * grace would judge the path before the transport has finished distinguishing
+ * "lossy" from "gone". */
+#define SYNC_DATA_GATE_GRACE_MS 12000
 #define SYNC_LINGER_MS         10000   /* default; UNMOOR_SYNC_LINGER_MS */
 #define SYNC_TX_CHUNK          SYNC_BACKLOG_CHUNK_SIZE
 
@@ -97,6 +107,113 @@ struct session;
 #define SYNC_RECOVERY_NONE   0U
 #define SYNC_RECOVERY_REPAIR 1U
 #define SYNC_RECOVERY_PROBE  2U
+
+/* Why the send-side DATA gate is shut, as a bitmask.  Both terms are
+ * outgoing-facing: nothing the receive direction does appears here. */
+#define SYNC_GATE_OPEN        0U
+#define SYNC_GATE_PEER_SILENT 1U  /* no authenticated frame for the grace */
+#define SYNC_GATE_NO_DELIVERY 2U  /* backlog present, frontier did not move */
+
+/* -------------------------------------------------------------------------
+ * Bounded TX instrumentation
+ *
+ * These counters exist to explain a capture, not to restate the constants a
+ * reader could have read out of this header.  A packet-size table that only
+ * repeats SYNC_DATA_PAYLOAD_MAX explains nothing; the question worth
+ * answering is why a given datagram was *not* that size, so every admitted
+ * DATA frame is attributed to one producer class and one short-payload
+ * reason.  Nothing here is authority: no send, prune, completion, credit or
+ * timer decision may read these fields.
+ * ---------------------------------------------------------------------- */
+
+/* The three producers of terminal DATA.  Every admitted DATA datagram is
+ * exactly one of these; there is deliberately no "unknown" class, because a
+ * frame that could not be attributed would make the totals unreconcilable
+ * against a capture. */
+#define SYNC_TX_CLASS_NEW    0U
+#define SYNC_TX_CLASS_REPAIR 1U
+#define SYNC_TX_CLASS_PROBE  2U
+#define SYNC_TX_CLASS_COUNT  3U
+
+/* Why an admitted DATA payload was below the payload ceiling in force at
+ * that moment.  Exactly one reason is charged per admitted frame, and the
+ * classification order is fixed so two causes that coincide are always
+ * reported the same way: ceiling, then credit/stream limit, then the peer
+ * bitmap boundary, then the end of the peer map, then the probe's own bound.
+ * SYNC_SHORT_OTHER is a real bucket, not a placeholder: a nonzero value
+ * means this list no longer covers the code. */
+#define SYNC_SHORT_NONE        0U  /* at the ceiling; not a short frame */
+#define SYNC_SHORT_TAIL        1U  /* interactive: the stream tip cut it */
+#define SYNC_SHORT_CREDIT      2U  /* peer credit cut it */
+#define SYNC_SHORT_SINK        3U  /* credit cut it and the peer sink is blocked */
+#define SYNC_SHORT_BITMAP      4U  /* the next block is already present */
+#define SYNC_SHORT_REPAIR_TAIL 5U  /* ran into the end of the peer bitmap */
+#define SYNC_SHORT_PROBE       6U  /* the probe's own three-block bound */
+#define SYNC_SHORT_OTHER       7U
+#define SYNC_SHORT_COUNT       8U
+
+/* Payload-size histogram.  Bucket i covers [i*64+1, (i+1)*64]; a zero-length
+ * DATA payload cannot be admitted, so no bucket has to represent one.  The
+ * bucket count covers the largest payload this build can emit. */
+#define SYNC_SIZE_BUCKET_BYTES 64U
+#define SYNC_SIZE_BUCKETS      \
+    ((SYNC_DATA_PAYLOAD_MAX + SYNC_SIZE_BUCKET_BYTES - 1U) / \
+     SYNC_SIZE_BUCKET_BYTES)
+
+typedef struct {
+    /* Admitted / terminal-completed / terminal-failed DATA datagrams and
+     * their payload bytes, per producer class.  `attempts` counts frames the
+     * session accepted for the wire, so attempts == completed + failed +
+     * (whatever is still in flight); payload bytes exclude the 12-byte sync
+     * header, the 16-byte AEAD tag and the 12-byte frame header, all of
+     * which a capture sees and this counter does not. */
+    uint64_t attempts[SYNC_TX_CLASS_COUNT];
+    uint64_t completed[SYNC_TX_CLASS_COUNT];
+    uint64_t failed[SYNC_TX_CLASS_COUNT];
+    uint64_t payload_attempted[SYNC_TX_CLASS_COUNT];
+    uint64_t payload_completed[SYNC_TX_CLASS_COUNT];
+
+    /* Size distribution of admitted DATA payloads, all classes together. */
+    uint64_t size_bucket[SYNC_SIZE_BUCKETS];
+    uint64_t at_ceiling;    /* payload == the ceiling in force at admission */
+    uint64_t near_ceiling;  /* within one bucket below that ceiling */
+    uint64_t short_reason[SYNC_SHORT_COUNT];
+    uint16_t max_payload;
+    uint16_t last_ceiling;  /* sync_payload_max() at the last admission */
+
+    /* Read-side quota gate, counted as edges rather than sampled, so a
+     * diagnostic taken between two closes still shows they happened. */
+    uint32_t source_blocked_closes;
+    uint32_t source_blocked_opens;
+
+    /* Full-buffer evidence. "Full" has to be a measured state, never an
+     * elapsed time. `retained_peak` is the high-water `tip - base` taken at
+     * every admission rather than at snapshot time, so a peak reached and
+     * drained between two SIGUSR1 reads still shows; equal to
+     * `quota` it says the cap was genuinely met, and above it, that the
+     * `sync_tx_room_instance` clamp let a byte past. `source_blocked_ms` is
+     * the time the quota gate actually held the source shut, which is what
+     * backpressure means; it excludes the interval still open at the
+     * snapshot, and the diagnostic adds that separately. */
+    uint64_t retained_peak;
+    int64_t  source_blocked_ms;
+
+    /* Quiesced-cliff evidence.  A capture measures datagrams and their sizes,
+     * but every sync payload is inside the AEAD, so nothing on the wire can
+     * separate a first transmission from a retransmission.  These split the
+     * single RECOVERY class into the two producers that mean different things:
+     * bitmap repair names blocks the peer reported missing, and cliff repair
+     * names an extent the peer has no vocabulary to report at all.  Their sums
+     * must reconcile with `attempts[REPAIR]` and `payload_attempted[REPAIR]`,
+     * which is what makes the network account checkable instead of inferred. */
+    uint64_t cliff_arms;             /* immutable recovery ends promoted */
+    uint64_t cliff_repair_attempts;
+    uint64_t cliff_repair_completed;
+    uint64_t cliff_repair_payload;
+    uint64_t bitmap_repair_attempts;
+    uint64_t bitmap_repair_completed;
+    uint64_t bitmap_repair_payload;
+} sync_tx_stats_t;
 
 /* -------------------------------------------------------------------------
  * Per-direction state, embedded in struct session
@@ -139,6 +256,17 @@ typedef struct {
     uint8_t  recovery_cursor; /* repair -> probe -> FIN, skipping idle peers */
     uint64_t recovery_pending_generation;
     uint64_t recovery_pending_end;
+    /* Retained payload length of the one outstanding record in each lane.
+     * Observation only: it lets the terminal callback attribute bytes to the
+     * frame that actually finished instead of re-deriving a length from an
+     * offset that may since have moved. */
+    uint16_t new_pending_len;
+    uint16_t recovery_pending_len;
+    /* Which repair producer owns the outstanding RECOVERY record, so its
+     * completion is charged to the same counter as its attempt.  The cliff
+     * may have cleared between the two, so the flag is retained rather than
+     * re-derived. */
+    uint8_t  recovery_pending_synthetic;
 
     /* FIN */
     int      fin_pending;
@@ -166,7 +294,46 @@ typedef struct {
     int64_t  linger_ms;
     int      close_started;
 
+    /* Delivery authority for the send-side DATA gate: the monotonic time of
+     * the last chain-verified advance of the peer's frontier, re-anchored when
+     * a first frame reaches a terminal handoff so the interval always starts
+     * at a real event.  Written in exactly two places and by nothing else -
+     * not by credit growth, not by a status record, not by a path change, and
+     * not by anything in the receive direction. */
+    int64_t  last_frontier_ms;
+
+    /* Quiesced-cliff synthetic repair.  When the source is quiet and the
+     * return path is lost, the retained backlog is sent-but-lost: `sent` has
+     * already reached `tip`, while the peer's bitmap is anchored at its own
+     * frontier and can only describe bytes it has seen.  A total outage
+     * therefore leaves a cliff rather than holes, and no repair grant is ever
+     * armed.  These three fields are the whole sender-side authority for
+     * synthesising that extent.  None of them is on the wire, no peer can
+     * observe one, and an unpatched peer is unaffected in either direction.
+     *
+     * `last_source_ms` is written only where the source actually publishes.
+     * `cliff_candidate_end` is recorded only by a successful probe handoff
+     * over a fully handed-off, quiet source.  `cliff_end` is the snapshot a
+     * chain-verified frontier advance promoted it to, and is immutable for the
+     * life of the cliff: later acks may drain it, never grow it. */
+    int64_t  last_source_ms;
+    uint64_t cliff_candidate_end;
+    uint64_t cliff_end;
+
     unsigned gate_state;    /* bit0 quota gate, bit1 credit gate (log edges) */
+    /* When the quota gate last shut, 0 when open.  Kept beside `gate_state`
+     * because the two are written together; the accumulated total lives in
+     * `stats.source_blocked_ms`. */
+    int64_t  source_blocked_since_ms;
+    /* Send-side DATA gate observation.  The gate itself is recomputed from
+     * absolute state on every read; these fields only describe it. */
+    int      peer_sink_blocked;  /* last non-stale SINK_BLOCKED report */
+    unsigned data_gate_reason;   /* SYNC_GATE_* of the current or last close */
+    uint32_t data_gate_closes;
+    uint32_t data_gate_opens;
+    int64_t  data_gate_closed_ms; /* start of the current close, 0 when open */
+    int64_t  data_gate_paused_ms; /* cumulative closed time */
+    sync_tx_stats_t stats;  /* bounded observation; never read as authority */
     unsigned log_once;      /* bit0 malformed ack */
 } sync_tx_t;
 

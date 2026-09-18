@@ -384,6 +384,33 @@ a stalled listener can remain alive until it is closed by an operator or by
 normal session teardown. Stale return-path mappings after a long standby
 remain a known limitation, described in [`SECURITY.md`](SECURITY.md).
 
+A third thing appears on stderr rather than in the status line. When your own
+outgoing bytes stop being confirmed — the peer produces no authenticated
+traffic for twelve seconds, or the confirmed frontier stops advancing for that
+long while bytes are still outstanding — the client stops sending new terminal
+data and says so:
+
+```
+unmoor sync: no delivery confirmation for 12000 ms — pausing terminal sends, keeping liveness
+```
+
+This is a pause, not a failure, and not a disconnect. Admitted bytes are
+retained, keepalives and path probes continue, and the session stays open. When
+delivery is confirmed again the client prints
+
+```
+unmoor sync: peer confirmed delivery — resuming terminal sends
+```
+
+and the retained bytes go out. The first line without the second means the path
+has not recovered yet; that is a question about the network between the two
+endpoints, not about the client. Both lines are written only when the terminal
+can accept asynchronous text; a session driving a full-screen program does not
+get them at all, and they are skipped rather than deferred. The `SIGUSR1`
+snapshot carries the same state unconditionally — look for the `data-gate`
+line, which counts how many times the gate has closed and reopened and how long
+it has held sends paused.
+
 Finally: `make check` and `make smoke` are the checks that run from this tree
 on a single host. Multi-host roaming, impaired paths and loss matrices are
 covered by the two-machine gate reported in [`SOURCE.md`](SOURCE.md), which
@@ -414,6 +441,7 @@ receive `PTY_OPEN_ACK`, and present a remote prompt. Run `hostname`, then
 | Linux client refuses confinement | Landlock or seccomp is unavailable/incomplete | Use a supporting kernel, or explicitly accept `--confine=best-effort`. Do not add the flag merely to suppress a message. |
 | Attach socket is refused | Parent ownership/mode or socket path is wrong | Use an absolute path; make the parent owned by you and mode 0700. |
 | A command stops producing output while backlog is high | Exact-stream backpressure | Query with `Ctrl-] s`; wait for the confirmed frontier to catch up or interrupt the remote producer. Do not interpret slow draining as dropped admitted data. |
+| `no delivery confirmation for 12000 ms — pausing terminal sends` | Your outgoing bytes stopped being confirmed | Not a disconnect and not data loss; sends resume by themselves once delivery is confirmed. Treat a pause that never ends as a path problem and check the same things as a `STALLED` client. |
 | Session remains `STALLED` after a long outage | No authenticated return traffic reaches the client | The session does not expire automatically. Exit locally with Enter then `~.` and inspect both endpoint logs. |
 | File destination already exists | Atomic install refuses replacement | Verify the target, then repeat with `--force` only when replacement is intended. |
 

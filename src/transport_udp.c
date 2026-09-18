@@ -931,6 +931,7 @@ static int udp_send(transport_t *base, const uint8_t *data, size_t len)
         return -1;
     }
     t->stats.tx_ok++;
+    t->stats.tx_bytes += (uint64_t)len;
     return 0;
 }
 
@@ -947,11 +948,13 @@ static int udp_send_step(transport_t *base, const uint8_t *data, size_t len)
     ssize_t n = sendto(t->fd[t->peer_leg], data, len, 0,
                        (struct sockaddr *)&t->peer, t->peer_len);
     if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+        t->stats.tx_would_block++;
         errno = 0;
         return TRANSPORT_SEND_WOULD_BLOCK;
     }
     if (n < 0 && errno == EMSGSIZE) {
         t->stats.tx_fail++;
+        t->stats.tx_too_large++;
         errno = 0;
         return TRANSPORT_SEND_TOO_LARGE;
     }
@@ -961,6 +964,7 @@ static int udp_send_step(transport_t *base, const uint8_t *data, size_t len)
         return TRANSPORT_SEND_FAILED;
     }
     t->stats.tx_ok++;
+    t->stats.tx_bytes += (uint64_t)len;
     return TRANSPORT_SEND_COMPLETE;
 }
 
@@ -983,11 +987,13 @@ static int udp_send_step_to(transport_t *base,
     n = sendto(t->fd[path->local_leg], data, len, 0,
                (struct sockaddr *)&peer, peer_len);
     if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+        t->stats.tx_would_block++;
         errno = 0;
         return TRANSPORT_SEND_WOULD_BLOCK;
     }
     if (n < 0 && errno == EMSGSIZE) {
         t->stats.tx_fail++;
+        t->stats.tx_too_large++;
         errno = 0;
         return TRANSPORT_SEND_TOO_LARGE;
     }
@@ -1001,6 +1007,7 @@ static int udp_send_step_to(transport_t *base,
         return TRANSPORT_SEND_FAILED;
     }
     t->stats.tx_ok++;
+    t->stats.tx_bytes += (uint64_t)len;
     return TRANSPORT_SEND_COMPLETE;
 }
 
@@ -1124,6 +1131,7 @@ static int udp_recv_from(transport_t *base, uint8_t *buf, size_t max,
     t->cand_leg = selected;
     t->have_cand = 1;
     t->stats.rx_ok++;
+    t->stats.rx_bytes += (uint64_t)length;
     return length;
 }
 
@@ -1146,6 +1154,7 @@ static int udp_recv(transport_t *base, uint8_t *buf, size_t max,
     t->cand_leg = selected;
     t->have_cand = 1;
     t->stats.rx_ok++;
+    t->stats.rx_bytes += (uint64_t)length;
     return length;
 }
 
@@ -1189,6 +1198,7 @@ static int udp_recv_source(transport_t *base, uint8_t *buf, size_t max,
     t->cand_leg = selected;
     t->have_cand = 1;
     t->stats.rx_ok++;
+    t->stats.rx_bytes += (uint64_t)length;
     return length;
 }
 

@@ -310,23 +310,65 @@ static int tx_absorb_range(sync_tx_t *tx, sync_monitor_binding_t *binding,
  * A completed result rebuilds the current view without starting another pass. */
 static int tx_repair_view(const session_t *s, const sync_tx_t *tx,
                           int64_t now, int normalize,
-                          sync_repair_view_t *view, int64_t *pass_out)
+                          sync_repair_view_t *view, int64_t *pass_out,
+                          int *synthetic_out)
 {
     uint64_t map_base, map_end;
     uint64_t limit = tx->tip;
     uint64_t cursor = tx->repair_cursor;
     int64_t pass = tx->repair_pass_ms;
+    uint32_t bits = tx->repair_bits;
+    int synthetic = 0;
 
+    if (synthetic_out)
+        *synthetic_out = 0;
     if (!tx->repair_plan_valid || tx->repair_attempts_left == 0 ||
         tx->recovery_send_pending || tx->fin_send_pending)
         return 0;
-    if (sync_repair_plan_extent(tx->repair_frontier, tx->repair_bits,
-                                &map_base, &map_end) != 0)
-        return -1;
+    /* A grant armed for a cliff outlives the cliff when a publication cancels
+     * it mid-drain.  The empty peer map is then not a description of an
+     * unreportable extent but simply an empty map, and the plan geometry has
+     * no extent to build.  Say so here rather than letting the planner be
+     * asked for a zero-block extent. */
+    if (bits == 0U && tx->cliff_end == 0U)
+        return 0;
     if (tx->peer_credit < limit)
         limit = tx->peer_credit;
     if (tx->sent < limit)
         limit = tx->sent;
+    if (bits == 0U && tx->cliff_end != 0U) {
+        /* The peer's map is empty because it has nothing above its own
+         * frontier to describe, not because nothing is missing: a total
+         * outage over a quiet source leaves a cliff rather than holes, and
+         * the ack grammar has no way to say "I have none of it".  Describe
+         * the promoted extent as all-missing here and only here.  The view is
+         * the caller-owned trusted copy, so `tx->repair_bits` and
+         * `tx->repair_bitmap` keep byte-for-byte what the peer actually sent
+         * and every later ack still overwrites them with the truth.
+         *
+         * The snapshot binds in addition to credit, `sent` and the tip.  A
+         * remaining extent that lies entirely inside the unaligned prefix
+         * below the first whole block is left to the probe, which repairs
+         * contiguously from the base and clears it within one RTO. */
+        uint64_t end = tx->cliff_end;
+        uint64_t blocks;
+
+        if (end > limit)
+            end = limit;
+        limit = end;
+        map_base = align64_up(tx->repair_frontier);
+        if (end <= map_base)
+            return 0;
+        blocks = (end - map_base + (SYNC_GRID - 1U)) / SYNC_GRID;
+        if (blocks > SYNC_ACK_BITS_MAX)
+            blocks = SYNC_ACK_BITS_MAX;
+        bits = (uint32_t)blocks;
+        map_end = map_base + (uint64_t)bits * SYNC_GRID;
+        synthetic = 1;
+    } else if (sync_repair_plan_extent(tx->repair_frontier, bits,
+                                       &map_base, &map_end) != 0) {
+        return -1;
+    }
     if (normalize && (cursor >= map_end || cursor >= limit)) {
         if (now < pass + tx->rto_ms)
             return 0;
@@ -339,12 +381,72 @@ static int tx_repair_view(const session_t *s, const sync_tx_t *tx,
     view->frontier = tx->repair_frontier;
     view->cursor = cursor;
     view->limit = limit;
-    view->bits = tx->repair_bits;
+    view->bits = bits;
     view->payload_max = (uint16_t)sync_payload_max(s);
-    memcpy(view->bitmap, tx->repair_bitmap, ((size_t)view->bits + 7U) / 8U);
+    /* A synthetic map is all-zero by construction — every block missing — so
+     * the memset above already wrote it. */
+    if (!synthetic)
+        memcpy(view->bitmap, tx->repair_bitmap, ((size_t)bits + 7U) / 8U);
     if (pass_out)
         *pass_out = pass;
+    if (synthetic_out)
+        *synthetic_out = synthetic;
     return 1;
+}
+
+/* Attribute one admitted DATA frame to its producer class and the reason its
+ * payload fell short of the ceiling.  Observation only: every caller has
+ * already decided what to send, and nothing downstream reads these fields. */
+static void sync_tx_stats_admit(sync_tx_stats_t *st, unsigned cls,
+                                size_t len, size_t ceiling,
+                                unsigned short_reason)
+{
+    size_t bucket;
+
+    if (cls >= SYNC_TX_CLASS_COUNT || len == 0U ||
+        short_reason >= SYNC_SHORT_COUNT)
+        return;
+    st->attempts[cls]++;
+    st->payload_attempted[cls] += (uint64_t)len;
+    bucket = (len - 1U) / SYNC_SIZE_BUCKET_BYTES;
+    if (bucket < SYNC_SIZE_BUCKETS)
+        st->size_bucket[bucket]++;
+    if (ceiling > 0U) {
+        if (len >= ceiling)
+            st->at_ceiling++;
+        else if (len + SYNC_SIZE_BUCKET_BYTES > ceiling)
+            st->near_ceiling++;
+        st->last_ceiling = (uint16_t)ceiling;
+    }
+    if (len > st->max_payload)
+        st->max_payload = (uint16_t)len;
+    st->short_reason[short_reason]++;
+}
+
+/* Charge one terminal result against the record that produced it. */
+static void sync_tx_stats_finish(sync_tx_stats_t *st, unsigned cls,
+                                 uint16_t len, int completed)
+{
+    if (cls >= SYNC_TX_CLASS_COUNT)
+        return;
+    if (completed) {
+        st->completed[cls]++;
+        st->payload_completed[cls] += (uint64_t)len;
+    } else {
+        st->failed[cls]++;
+    }
+}
+
+/* Which of the two terms of `limit` in a NEW or PROBE range actually cut it.
+ * The peer's own SINK_BLOCKED report separates "the window is closed because
+ * the peer is not reading" from ordinary flow control, which is the
+ * distinction that tells an operator whether the wire or the far sink is the
+ * constraint. */
+static unsigned sync_tx_limit_reason(const sync_tx_t *tx, uint64_t end)
+{
+    if (end != tx->peer_credit)
+        return SYNC_SHORT_TAIL;
+    return tx->peer_sink_blocked ? SYNC_SHORT_SINK : SYNC_SHORT_CREDIT;
 }
 
 /* Admit stream bytes [off, off+len). Send-scheduler advances every transport-owned
@@ -354,6 +456,7 @@ static int tx_repair_view(const session_t *s, const sync_tx_t *tx,
 static int send_sync_data_range(session_t *s, uint8_t slot, sync_tx_t *tx,
                                 uint64_t off, size_t len,
                                 uint8_t recovery_kind,
+                                unsigned short_reason,
                                 sync_repair_view_t *current_view,
                                 const sync_repair_result_t *repair_result)
 {
@@ -362,6 +465,7 @@ static int send_sync_data_range(session_t *s, uint8_t slot, sync_tx_t *tx,
     session_tx_done_t done;
     uint64_t arg0;
     uint64_t arg1;
+    unsigned cls;
     int rc;
 
     if (binding) {
@@ -384,7 +488,8 @@ static int send_sync_data_range(session_t *s, uint8_t slot, sync_tx_t *tx,
         }
         if (recovery_kind == SYNC_RECOVERY_REPAIR &&
             (!current_view || !repair_result || off < tx->base ||
-             tx_repair_view(s, tx, tx->now_cache, 0, current_view, NULL) != 1 ||
+             tx_repair_view(s, tx, tx->now_cache, 0, current_view, NULL,
+                            NULL) != 1 ||
              sync_repair_plan_check(current_view, repair_result) != 0)) {
             crypto_memzero(body, sizeof(body));
             return 1;
@@ -399,6 +504,8 @@ static int send_sync_data_range(session_t *s, uint8_t slot, sync_tx_t *tx,
         arg1 = 0;
         tx->new_send_pending = 1;
         tx->new_pending_end = arg0;
+        tx->new_pending_len = (uint16_t)len;
+        cls = SYNC_TX_CLASS_NEW;
     } else {
         if (tx->recovery_send_pending || tx->fin_send_pending)
             return 1;
@@ -413,7 +520,17 @@ static int send_sync_data_range(session_t *s, uint8_t slot, sync_tx_t *tx,
         tx->recovery_pending_kind = recovery_kind;
         tx->recovery_pending_generation = arg0;
         tx->recovery_pending_end = off + len;
+        tx->recovery_pending_len = (uint16_t)len;
+        cls = recovery_kind == SYNC_RECOVERY_REPAIR
+            ? SYNC_TX_CLASS_REPAIR : SYNC_TX_CLASS_PROBE;
     }
+    /* Count the attempt here, at the moment the frame acquires its terminal
+     * owner, not after the send call returns: a fake-wire FAILED inside that
+     * call issues the terminal callback synchronously, and a failure charged
+     * against an attempt that was never counted would make the totals
+     * impossible to reconcile against a capture. */
+    sync_tx_stats_admit(&tx->stats, cls, len, sync_payload_max(s),
+                        short_reason);
 
     body[0] = 1;
     body[1] = 0;
@@ -426,6 +543,7 @@ static int send_sync_data_range(session_t *s, uint8_t slot, sync_tx_t *tx,
             tx->new_send_pending = 0;
         else
             tx->recovery_send_pending = 0;
+        tx->stats.failed[cls]++;
         sync_fatal(s, "tx backlog slot invariant violated");
         return -1;
     }
@@ -438,13 +556,19 @@ static int send_sync_data_range(session_t *s, uint8_t slot, sync_tx_t *tx,
         crypto_memzero(body, sizeof(body));
     if (rc != 0) {
         /* An immediate fake-wire FAILED already issued the callback. Only
-         * roll back an admission that never acquired a terminal owner. */
+         * roll back an admission that never acquired a terminal owner.  The
+         * same test decides who charges the failure: the callback did it
+         * already when it cleared the flag, so charge it here only on the
+         * rollback path that has no callback behind it. */
         if (recovery_kind == SYNC_RECOVERY_NONE) {
-            if (tx->new_send_pending)
+            if (tx->new_send_pending) {
                 tx->new_send_pending = 0;
+                tx->stats.failed[cls]++;
+            }
         } else if (tx->recovery_send_pending) {
             tx->recovery_send_pending = 0;
             tx->recovery_pending_kind = SYNC_RECOVERY_NONE;
+            tx->stats.failed[cls]++;
         }
         return -1;
     }
@@ -484,6 +608,52 @@ static int send_sync_fin(session_t *s, uint8_t slot, sync_tx_t *tx,
     return rc;
 }
 
+/* Why the send-side DATA gate is shut right now, recomputed from absolute
+ * state.  Two terms, both outgoing-facing, ORed:
+ *
+ *   1. No authenticated frame from the peer for the grace.  Necessary but not
+ *      sufficient on its own to keep DATA flowing: an ordinary heartbeat
+ *      clears this term and only this term.
+ *   2. Bytes are outstanding and the chain-verified peer frontier has not
+ *      moved for the grace.  A heartbeat cannot clear this, and neither can
+ *      credit growth; only a frontier advance can.
+ *
+ * Term 2 is guarded by was_outstanding so the interval is always measured
+ * from a frame that actually reached the path.  Term 1 treats an unset
+ * last_authenticated_ms as "nothing observed yet", the same guard the session
+ * diagnostic already applies, so a session that has not yet recorded contact
+ * is not judged to have lost it.
+ *
+ * Nothing in the receive direction appears here.  A silent peer, a blocked
+ * local sink or incoming backlog cannot close this gate on their own; only
+ * the absence of confirmation for our own outgoing bytes can.  The converse
+ * is not obtainable: delivery evidence necessarily travels back along the
+ * incoming direction, so an endpoint whose return path is dead cannot prove
+ * its outgoing bytes are arriving, by any local means.
+ *
+ * This is a third send-side governor stacked on quota and credit.  It gates
+ * sends only.  Source reads keep their own quota backpressure, so the
+ * backlog goes on filling to its quota while the gate is shut. */
+static unsigned sync_data_gate_reason(const session_t *s, const sync_tx_t *tx,
+                                      int64_t now)
+{
+    unsigned reason = SYNC_GATE_OPEN;
+
+    if (s->last_authenticated_ms > 0 &&
+        now - s->last_authenticated_ms >= SYNC_DATA_GATE_GRACE_MS)
+        reason |= SYNC_GATE_PEER_SILENT;
+    if (tx->was_outstanding && tx->tip > tx->base &&
+        now - tx->last_frontier_ms >= SYNC_DATA_GATE_GRACE_MS)
+        reason |= SYNC_GATE_NO_DELIVERY;
+    return reason;
+}
+
+static int sync_data_gate_closed(const session_t *s, const sync_tx_t *tx,
+                                 int64_t now)
+{
+    return sync_data_gate_reason(s, tx, now) != SYNC_GATE_OPEN;
+}
+
 /* Push fresh bytes up to min(tip, peer_credit). Uncharged: the pacer billed
  * these bytes when they were read from the source. */
 static int tx_pump(session_t *s, uint8_t slot, sync_tx_t *tx)
@@ -491,18 +661,61 @@ static int tx_pump(session_t *s, uint8_t slot, sync_tx_t *tx)
     size_t pmax = sync_payload_max(s);
     uint64_t limit = tx->tip < tx->peer_credit ? tx->tip : tx->peer_credit;
 
+    unsigned reason;
     size_t len;
 
     if (tx->new_send_pending || tx->sent >= limit)
         return 0;
+    if (sync_data_gate_closed(s, tx, tx->now_cache))
+        return 0;
     len = (size_t)(limit - tx->sent);
-    if (len > pmax)
+    if (len > pmax) {
         len = pmax;
+        reason = SYNC_SHORT_NONE;
+    } else {
+        /* The send stopped at `limit`, so one of its two terms cut it: the
+         * stream tip (an ordinary interactive tail, and the common case) or
+         * the peer's credit window. */
+        reason = sync_tx_limit_reason(tx, limit);
+    }
     {
         int rc = send_sync_data_range(s, slot, tx, tx->sent, len,
-                                      SYNC_RECOVERY_NONE, NULL, NULL);
+                                      SYNC_RECOVERY_NONE, reason, NULL, NULL);
         return rc == 0 ? 1 : (rc < 0 ? -1 : 0);
     }
+}
+
+/* Why a repair range came out short, re-derived from the same view the
+ * planner saw rather than by extending the planner's result struct.  This is
+ * deliberately an independent second reading: the planner is the gated
+ * search and must not grow an observation field, and a diagnostic that can
+ * only ever agree with the thing it describes is worth nothing.  The view and
+ * result are already validated by the caller. */
+static unsigned repair_short_reason(const sync_repair_view_t *view,
+                                    const sync_repair_result_t *result)
+{
+    uint64_t map_base, map_end, end;
+    uint64_t block;
+
+    if (result->length >= view->payload_max)
+        return SYNC_SHORT_NONE;
+    end = result->offset + result->length;
+    if (end >= view->limit)
+        return SYNC_SHORT_CREDIT; /* min(tip, sent, peer credit) cut it */
+    if (sync_repair_plan_extent(view->frontier, view->bits,
+                                &map_base, &map_end) != 0)
+        return SYNC_SHORT_OTHER;
+    if (end == map_base)
+        return SYNC_SHORT_BITMAP; /* sub-block prefix below the map */
+    if (end >= map_end)
+        return SYNC_SHORT_REPAIR_TAIL;
+    if (end < map_base || (end - map_base) % SYNC_PLAN_GRID != 0U)
+        return SYNC_SHORT_OTHER;
+    block = (end - map_base) / SYNC_PLAN_GRID;
+    if (block < view->bits &&
+        ((((uint32_t)view->bitmap[block >> 3]) >> (block & 7U)) & 1U) != 0U)
+        return SYNC_SHORT_BITMAP;
+    return SYNC_SHORT_OTHER;
 }
 
 /* Repair from a peer bitmap, lowest-missing-first, at most SYNC_ACK_FRAMES
@@ -517,13 +730,17 @@ static int tx_repair_try(session_t *s, uint8_t slot, sync_tx_t *tx,
     sync_repair_view_t view = {0};
     sync_repair_result_t result;
     int64_t pass;
+    int synthetic = 0;
     int rc;
 
     if (binding && (!sync_monitor_live(s, binding) ||
                     !session_application_send_eligible(s)))
         return 0;
+    if (sync_data_gate_closed(s, tx, now))
+        return 0;
     rc = tx_repair_view(s, tx, now,
-                        !binding || binding->plan_operation == 0, &view, &pass);
+                        !binding || binding->plan_operation == 0, &view, &pass,
+                        &synthetic);
     if (rc == 0)
         return 0;
     if (rc < 0) {
@@ -593,8 +810,26 @@ static int tx_repair_try(session_t *s, uint8_t slot, sync_tx_t *tx,
     {
         int rc = send_sync_data_range(s, slot, tx, result.offset,
                                       result.length, SYNC_RECOVERY_REPAIR,
+                                      repair_short_reason(&view, &result),
                                       binding ? &view : NULL,
                                       binding ? &result : NULL);
+        if (rc == 0) {
+            /* Split the one RECOVERY class by producer.  Sync payloads are
+             * inside the AEAD, so a capture can measure datagrams and sizes
+             * but never which bytes are first transmissions; without this
+             * split the network account cannot be checked against the product
+             * account at all.  Retained on the record so the completion is
+             * charged where the attempt was, even if the cliff clears in
+             * between. */
+            tx->recovery_pending_synthetic = synthetic ? 1U : 0U;
+            if (synthetic) {
+                tx->stats.cliff_repair_attempts++;
+                tx->stats.cliff_repair_payload += (uint64_t)result.length;
+            } else {
+                tx->stats.bitmap_repair_attempts++;
+                tx->stats.bitmap_repair_payload += (uint64_t)result.length;
+            }
+        }
         return rc == 0 ? 1 : (rc < 0 ? -1 : 0);
     }
 }
@@ -827,6 +1062,19 @@ int sync_rx_pending(const struct session *s)
 
 static int tx_source_published(session_t *s, uint8_t slot, sync_tx_t *tx)
 {
+    /* The one place both the classic and the retained-source paths publish,
+     * so the quiet clock and the cliff cancellation are the same event for
+     * both by construction rather than by two matching edits.
+     *
+     * Cancelling here is not tidiness.  A synthetic cliff describes history;
+     * a publication is the present.  Someone who starts typing while a screen
+     * is still catching up must not queue behind the drain, so real work ends
+     * the synthesis outright rather than sharing the budget with it.  The
+     * assignment precedes the pump below so this turn already sees it. */
+    tx->last_source_ms = tx->now_cache;
+    tx->cliff_candidate_end = 0;
+    tx->cliff_end = 0;
+
     /* If the prior stream prefix became fully acknowledged while its last
      * advertised credit stayed exactly at that frontier, a lost credit-open
      * ACK leaves no NEW byte eligible for first transmission.  There is
@@ -849,6 +1097,19 @@ static int tx_source_published(session_t *s, uint8_t slot, sync_tx_t *tx)
      * this binding, and the local service must not report healthy success. */
     return sync_monitor_slot(s, slot) &&
            !sync_monitor_live(s, s->sync_monitor) ? -1 : 0;
+}
+
+/* High-water retained occupancy, taken where it can only rise. `base` moves
+ * up on acknowledgement and never raises the peak, so admission is the whole
+ * sample set; taking it here rather than at snapshot time is what lets a
+ * window that filled and drained between two SIGUSR1 reads still be read as
+ * having been full. */
+static void sync_tx_note_peak(sync_tx_t *tx)
+{
+    uint64_t used = tx->tip >= tx->base ? tx->tip - tx->base : 0U;
+
+    if (used > tx->stats.retained_peak)
+        tx->stats.retained_peak = used;
 }
 
 int sync_tx_append_instance(struct session *s, uint8_t slot,
@@ -877,6 +1138,7 @@ int sync_tx_append_instance(struct session *s, uint8_t slot,
             return -1;
         }
         tx->tip = sync_source_tip(binding->source);
+        sync_tx_note_peak(tx);
         return tx_source_published(s, slot, tx);
     }
     if (tx == NULL || !tx->active || len == 0)
@@ -890,6 +1152,7 @@ int sync_tx_append_instance(struct session *s, uint8_t slot,
         return -1;
     }
     tx->tip += len;
+    sync_tx_note_peak(tx);
     (void)tx_source_published(s, slot, tx);
     return 0;
 }
@@ -1023,6 +1286,7 @@ out:
     }
     if (published) {
         s->sync_tx.tip = sync_source_tip(binding->source);
+        sync_tx_note_peak(&s->sync_tx);
         if (tx_source_published(s, 1U, &s->sync_tx) != 0) {
             binding->in_service = 0;
             return -1;
@@ -1375,6 +1639,31 @@ void sync_handle_ack_instance(struct session *s, uint8_t slot,
             tx->repair_cursor = frontier;
             tx->repair_pass_ms = now;
             progress = 1;
+            /* The only delivery evidence this endpoint can hold: a peer
+             * frontier that survived the chain compare above.  Credit growth,
+             * FIN_SEEN, SINK_BLOCKED and every status record are deliberately
+             * excluded — they prove the peer is alive, not that these bytes
+             * arrived.  Reopening the DATA gate is this line's authority and
+             * nothing else's. */
+            tx->last_frontier_ms = now;
+
+            /* The same line's authority, used once more.  A chain-verified
+             * advance is the only evidence this endpoint can hold that bytes
+             * are arriving, so it is the only thing allowed to turn a
+             * probe-confirmed proposal into carriage.  Promotion snapshots the
+             * end: from here the cliff may only drain, never grow, so no
+             * sequence of later acks can widen what one probe proposed.
+             *
+             * Order matters.  An advance that reached the current snapshot
+             * retires it first, so a single ack can finish one cliff without
+             * silently inheriting its authority for the next. */
+            if (tx->cliff_end != 0U && frontier >= tx->cliff_end)
+                tx->cliff_end = 0;
+            if (tx->cliff_end == 0U && tx->cliff_candidate_end > frontier) {
+                tx->cliff_end = tx->cliff_candidate_end;
+                tx->stats.cliff_arms++;
+            }
+            tx->cliff_candidate_end = 0;
         }
         if (flags & SYNC_ACK_FIN_SEEN) {
             if (!tx->fin_seen_observed) {
@@ -1390,8 +1679,14 @@ void sync_handle_ack_instance(struct session *s, uint8_t slot,
         tx->peer_credit = credit;
         progress = 1;
     }
-    if (!stale && (flags & SYNC_ACK_SINK_BLOCKED))
-        linger_progress = 1; /* peer alive, deliberately blocked */
+    if (!stale) {
+        /* Observation only, and deliberately last-report rather than sticky:
+         * nothing but the short-payload attribution reads this bit, and a
+         * peer that has resumed reading must stop being reported as blocked. */
+        tx->peer_sink_blocked = (flags & SYNC_ACK_SINK_BLOCKED) != 0;
+        if (flags & SYNC_ACK_SINK_BLOCKED)
+            linger_progress = 1; /* peer alive, deliberately blocked */
+    }
 
     if (progress) {
         tx->last_progress_ms = now;
@@ -1412,8 +1707,13 @@ void sync_handle_ack_instance(struct session *s, uint8_t slot,
         memset(tx->repair_bitmap, 0, sizeof(tx->repair_bitmap));
         if (bmlen != 0)
             memcpy(tx->repair_bitmap, body + SYNC_ACK_OVERHEAD, bmlen);
-        tx->repair_plan_valid = bits != 0;
-        tx->repair_attempts_left = bits != 0 ? SYNC_ACK_FRAMES : 0;
+        /* The same bounded four-frame grant, extended to the one case the
+         * bitmap cannot describe.  An active cliff keeps it armed through
+         * empty acks until the frontier reaches the snapshot; a non-empty
+         * bitmap still wins, because a peer that can name its holes is
+         * answered from its own report rather than from an assumption. */
+        tx->repair_plan_valid = bits != 0 || tx->cliff_end != 0U;
+        tx->repair_attempts_left = tx->repair_plan_valid ? SYNC_ACK_FRAMES : 0;
         if (tx->repair_cursor < frontier)
             tx->repair_cursor = frontier;
     }
@@ -1559,7 +1859,8 @@ static int tx_probe_try(session_t *s, uint8_t slot, sync_tx_t *tx,
         return 0;
 
     if (tx->tip > tx->base) {
-        uint64_t end = tx->base + 3 * SYNC_GRID;
+        uint64_t bound = tx->base + 3 * SYNC_GRID;
+        uint64_t end = bound;
         size_t pmax = sync_payload_max(s);
 
         if (end > tx->tip)
@@ -1569,14 +1870,26 @@ static int tx_probe_try(session_t *s, uint8_t slot, sync_tx_t *tx,
         if (end > tx->base + pmax)
             end = tx->base + pmax;
         if (end > tx->base) {
+            /* The probe is short by construction — three blocks, not the
+             * payload ceiling — so only a tip or credit cut below that bound
+             * is worth distinguishing from its own deliberate shortness. */
+            unsigned reason = end < bound
+                            ? sync_tx_limit_reason(tx, end)
+                            : SYNC_SHORT_PROBE;
             int rc = send_sync_data_range(s, slot, tx, tx->base,
                                           (size_t)(end - tx->base),
-                                          SYNC_RECOVERY_PROBE, NULL, NULL);
+                                          SYNC_RECOVERY_PROBE, reason,
+                                          NULL, NULL);
             return rc == 0 ? 1 : (rc < 0 ? -1 : 0);
         }
         if (tx->base > 0) {
+            /* Persist: this one byte exists precisely because the credit
+             * window is shut, so it is never anything but a window report. */
+            unsigned reason = tx->peer_sink_blocked ? SYNC_SHORT_SINK
+                                                    : SYNC_SHORT_CREDIT;
             int rc = send_sync_data_range(s, slot, tx, tx->base - 1, 1,
-                                          SYNC_RECOVERY_PROBE, NULL, NULL);
+                                          SYNC_RECOVERY_PROBE, reason,
+                                          NULL, NULL);
             return rc == 0 ? 1 : (rc < 0 ? -1 : 0);
         }
     }
@@ -1646,7 +1959,55 @@ static void tx_arm_first_network_timer(sync_tx_t *tx, int64_t now_ms)
     if (!tx->was_outstanding) {
         tx->was_outstanding = 1;
         tx->next_probe_ms = now_ms + tx->rto_ms;
+        /* Start of the interval in which an acknowledgement is owed.  Before
+         * this moment nothing had reached the path, so there was nothing for
+         * the peer to confirm and no grounds to judge the direction. */
+        tx->last_frontier_ms = now_ms;
     }
+}
+
+/*
+ * A probe that reached a terminal handoff is the only event allowed to
+ * propose a recovery end, because it is the only one that proves the whole
+ * conjunction at once: a datagram for this stream reached the local
+ * transport, `sent` has caught `tip` so the retained backlog is sent-but-lost
+ * rather than still queued behind a shut window, and the source has published
+ * nothing for two current RTOs.
+ *
+ * That last term is the measured bound, and its only job is to exclude a live
+ * source — the state in which absent bytes are in flight, not lost, and in
+ * which synthesising cost 95 KB of clean-path repair without advancing
+ * delivery.  It is read before the caller's backoff step, so "current" means
+ * the RTO that was in force when this probe was scheduled.
+ *
+ * Nothing is promoted here.  A candidate is a proposal that costs nothing
+ * until delivery evidence arrives, which is why it may be recorded while the
+ * path is still dark.
+ */
+static void tx_cliff_note_probe(sync_tx_t *tx, int64_t now_ms)
+{
+    uint64_t end;
+
+    if (tx->cliff_end != 0U)
+        return; /* one immutable end at a time; a later ack may not raise it */
+    if (tx->tip == 0U || tx->sent < tx->tip)
+        return; /* still publishing, or still held by the credit window */
+    if (tx->last_source_ms == 0 || now_ms < tx->last_source_ms)
+        return; /* nothing published yet, or a clock that cannot be trusted */
+    if (now_ms - tx->last_source_ms < 2 * tx->rto_ms)
+        return;
+
+    end = tx->tip;
+    if (tx->sent < end)
+        end = tx->sent;
+    /* `sent` can never exceed the credit the peer granted, so with tip ==
+     * sent this term cannot bind today.  It is kept because the cap has to
+     * remain true if that invariant ever stops holding: synthesising past
+     * what the peer authorised would be a bandwidth claim it never made. */
+    if (tx->peer_credit < end)
+        end = tx->peer_credit;
+    if (end > tx->base)
+        tx->cliff_candidate_end = end;
 }
 
 static void tx_advance_probe_timer(sync_tx_t *tx, int64_t now_ms)
@@ -1718,6 +2079,12 @@ void sync_send_result_instance(struct session *s, uint8_t slot,
     case SESSION_TX_DONE_SYNC_NEW:
         if (!tx->active)
             return;
+        /* Charge the terminal result against the retained record, and only
+         * while one is actually outstanding: a duplicate or stale callback
+         * must not be able to count a second completion for one datagram. */
+        if (tx->new_send_pending)
+            sync_tx_stats_finish(&tx->stats, SYNC_TX_CLASS_NEW,
+                                 tx->new_pending_len, completed);
         tx->new_send_pending = 0;
         if (completed) {
             if (arg0 > tx->sent)
@@ -1729,8 +2096,19 @@ void sync_send_result_instance(struct session *s, uint8_t slot,
     case SESSION_TX_DONE_SYNC_REPAIR:
         if (!tx->active)
             return;
+        if (tx->recovery_send_pending) {
+            sync_tx_stats_finish(&tx->stats, SYNC_TX_CLASS_REPAIR,
+                                 tx->recovery_pending_len, completed);
+            if (completed) {
+                if (tx->recovery_pending_synthetic)
+                    tx->stats.cliff_repair_completed++;
+                else
+                    tx->stats.bitmap_repair_completed++;
+            }
+        }
         tx->recovery_send_pending = 0;
         tx->recovery_pending_kind = SYNC_RECOVERY_NONE;
+        tx->recovery_pending_synthetic = 0U;
         if (tx->repair_plan_valid && tx->repair_generation == arg0) {
             if (tx->repair_attempts_left != 0)
                 tx->repair_attempts_left--;
@@ -1742,8 +2120,13 @@ void sync_send_result_instance(struct session *s, uint8_t slot,
     case SESSION_TX_DONE_SYNC_PROBE:
         if (!tx->active)
             return;
+        if (tx->recovery_send_pending)
+            sync_tx_stats_finish(&tx->stats, SYNC_TX_CLASS_PROBE,
+                                 tx->recovery_pending_len, completed);
         tx->recovery_send_pending = 0;
         tx->recovery_pending_kind = SYNC_RECOVERY_NONE;
+        if (completed)
+            tx_cliff_note_probe(tx, now_ms); /* before the backoff step */
         tx_advance_probe_timer(tx, now_ms);
         break;
 
@@ -1869,6 +2252,12 @@ void sync_path_changed_instance(struct session *s, uint8_t slot,
         rx_force_ack(rx);
     if (tx->repair_plan_valid)
         tx->repair_cursor = tx->repair_frontier;
+    /* A candidate is a proposal a probe made on a path that no longer exists,
+     * so it is dropped and has to be re-earned; the timer reset below makes
+     * that one probe away.  A promoted cliff is kept, because it rests on
+     * chain-verified delivery evidence and names bytes whose absence is a
+     * property of the stream, not of the path that was carrying it. */
+    tx->cliff_candidate_end = 0;
     if (tx->was_outstanding) {
         tx->next_probe_ms = now_ms;
         tx->recovery_cursor = SYNC_RECOVERY_RR_REPAIR;
@@ -1905,6 +2294,52 @@ static int sync_feedback_due(const sync_rx_t *rx, int64_t now)
            (holes && now >= rx->next_repeat_ms);
 }
 
+/* Edge accounting for the send-side DATA gate.  The gate itself is a pure
+ * function of absolute state and is recomputed at every read; this only
+ * records transitions, and performs the one repair a close requires.
+ *
+ * That repair: pausing NEW can strand the probe that is supposed to reopen
+ * the gate.  tx_probe_try() is inert while was_outstanding is 0, and
+ * was_outstanding is only set when a NEW or FIN frame reaches a terminal
+ * handoff.  A gate that closes before any frame got that far would pause NEW,
+ * leave the probe unarmed, and take the outgoing direction completely silent
+ * with nothing able to reopen it.  Arm the same bounded timer the idle-append
+ * persist case arms, for the same reason: the sender must not wait on an
+ * event it has no way to create. */
+static void sync_data_gate_observe(struct session *s, sync_tx_t *tx,
+                                   int64_t now)
+{
+    unsigned reason = sync_data_gate_reason(s, tx, now);
+    int was_closed = tx->data_gate_closed_ms != 0;
+
+    if (reason != SYNC_GATE_OPEN) {
+        tx->data_gate_reason = reason;
+        if (!was_closed) {
+            tx->data_gate_closes++;
+            tx->data_gate_closed_ms = now;
+            if (!session_async_terminal_text_suppressed(s))
+                fprintf(stderr,
+                        "unmoor sync: no delivery confirmation for %d ms "
+                        "— pausing terminal sends, keeping liveness\n",
+                        (int)SYNC_DATA_GATE_GRACE_MS);
+            if (tx->tip > tx->base) {
+                if (tx->rto_ms < SYNC_RTO_MIN_MS)
+                    tx->rto_ms = SYNC_RTO_MIN_MS;
+                tx_arm_first_network_timer(tx, now);
+            }
+        }
+        return;
+    }
+    if (was_closed) {
+        tx->data_gate_opens++;
+        tx->data_gate_paused_ms += now - tx->data_gate_closed_ms;
+        tx->data_gate_closed_ms = 0;
+        if (!session_async_terminal_text_suppressed(s))
+            fprintf(stderr, "unmoor sync: peer confirmed delivery — resuming "
+                            "terminal sends\n");
+    }
+}
+
 static void sync_maintain_instance(struct session *s, uint8_t slot,
                                    int64_t now)
 {
@@ -1930,13 +2365,28 @@ static void sync_maintain_instance(struct session *s, uint8_t slot,
     }
     if (tx->tip > tx->sent && tx->sent >= tx->peer_credit)
         gs |= 2U;
-    if ((gs & 1U) && !(tx->gate_state & 1U))
-        fprintf(stderr, "unmoor sync: backlog quota full — pausing source "
-                        "reads until the peer catches up\n");
-    if ((gs & 2U) && !(tx->gate_state & 2U))
+    if ((gs & 1U) && !(tx->gate_state & 1U)) {
+        tx->stats.source_blocked_closes++;
+        tx->source_blocked_since_ms = now;
+        if (!session_async_terminal_text_suppressed(s))
+            fprintf(stderr, "unmoor sync: backlog quota full — pausing source "
+                            "reads until the peer catches up\n");
+    } else if (!(gs & 1U) && (tx->gate_state & 1U)) {
+        tx->stats.source_blocked_opens++;
+        /* Close the interval here rather than sampling the gate at snapshot
+         * time: a full window that opened and shut again between two reads is
+         * exactly the case a sampled figure would report as never blocked. */
+        if (tx->source_blocked_since_ms != 0 &&
+            now > tx->source_blocked_since_ms)
+            tx->stats.source_blocked_ms += now - tx->source_blocked_since_ms;
+        tx->source_blocked_since_ms = 0;
+    }
+    if ((gs & 2U) && !(tx->gate_state & 2U) &&
+        !session_async_terminal_text_suppressed(s))
         fprintf(stderr, "unmoor sync: peer receive window full — transmit "
                         "paused, backlog absorbing\n");
     tx->gate_state = gs;
+    sync_data_gate_observe(s, tx, now);
 
     if (s->is_server && tx->fin_pending && tx->fin_first_attempted &&
         !tx->close_started) {
@@ -2094,6 +2544,36 @@ int64_t sync_next_deadline_instance(struct session *s, uint8_t slot,
     if (tx->fin_pending && !tx->fin_acked && !tx->fin_first_attempted &&
         !tx->fin_send_pending && tx->fin_retry_ms < d)
         d = tx->fin_retry_ms;
+    /* An unconsumed repair grant is ready local work, not a timer wait. The
+     * grant is per-ack and the arbiter emits at most one frame per
+     * event-loop turn, so without a due-now deadline here the loop sleeps
+     * until some unrelated event — in practice the next ack — and the whole
+     * SYNC_ACK_FRAMES grant collapses to about one frame per ack.
+     *
+     * The claim mirrors exactly what an unmonitored tx_repair_try() would
+     * admit this turn: a buildable view AND a plan that actually selects a
+     * range. A buildable view alone is not work — the cursor can already sit
+     * at the limit, or the map can be exhausted, and claiming due-now for
+     * those would poll(0) against nothing. Both calls are pure, so asking
+     * here commits no cursor and starts no pass.
+     *
+     * The monitored path is deliberately excluded. There a turn issues an
+     * asynchronous PLAN and returns without a frame, so a due-now claim would
+     * spin against the work cell rather than wait for its completion; that
+     * path is driven by the cell, not by this timer.
+     *
+     * Otherwise bounded by the grant itself: recovery_send_pending blocks
+     * re-admission until the frame reaches a terminal result, and every
+     * terminal repair decrements the grant. */
+    if (binding == NULL && !sync_data_gate_closed(s, tx, now)) {
+        sync_repair_view_t ready_view;
+        sync_repair_result_t ready_result;
+
+        if (tx_repair_view(s, tx, now, 1, &ready_view, NULL, NULL) == 1 &&
+            sync_repair_plan_choose(&ready_view, &ready_result) == 0 &&
+            ready_result.kind == SYNC_PLAN_RANGE)
+            d = now;
+    }
 linger:
     if (s->is_server && tx->fin_pending && !tx->close_started
         && (!binding || tx->fin_first_attempted)
@@ -2205,6 +2685,10 @@ static int sync_storage_init(session_t *s, uint8_t slot, uint64_t quota,
     tx->now_cache = mono_ms();
     tx->last_progress_ms = tx->now_cache;
     tx->last_linger_progress_ms = tx->now_cache;
+    /* Only a floor.  The gate's second term additionally requires
+     * was_outstanding, and arming that re-anchors this to the moment a frame
+     * first reached the path, so an injected clock never reads this value. */
+    tx->last_frontier_ms = tx->now_cache;
     tx->active = 1;
     rx->active = 1;
     if (bind_instance) {

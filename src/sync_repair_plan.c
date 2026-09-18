@@ -68,10 +68,6 @@ int sync_repair_plan_choose(const sync_repair_view_t *view,
             result->kind = SYNC_PLAN_EXHAUSTED;
             return 0;
         }
-        after = block + 1U;
-        while (after < view->bits && after - block < 3U &&
-               (((uint32_t)view->bitmap[after >> 3] >> (after & 7U)) & 1U) == 0U)
-            ++after;
         off = map_base + block * SYNC_PLAN_GRID;
         if (off < view->cursor)
             off = view->cursor;
@@ -79,6 +75,15 @@ int sync_repair_plan_choose(const sync_repair_view_t *view,
             result->kind = SYNC_PLAN_EXHAUSTED;
             return 0;
         }
+        /* Extend over consecutive missing blocks while the range still fits
+         * the session's own DATA payload budget. Every term here is bounded
+         * by the already-validated map extent, so the subtraction cannot
+         * wrap; stopping one block late is trimmed by the clamp below. */
+        after = block + 1U;
+        while (after < view->bits &&
+               map_base + after * SYNC_PLAN_GRID - off < view->payload_max &&
+               (((uint32_t)view->bitmap[after >> 3] >> (after & 7U)) & 1U) == 0U)
+            ++after;
         end = map_base + after * SYNC_PLAN_GRID;
         if (end > view->limit)
             end = view->limit;
@@ -117,7 +122,9 @@ int sync_repair_plan_check(const sync_repair_view_t *view,
         return -1;
     first = (result->offset - map_base) / SYNC_PLAN_GRID;
     last = (end - 1U - map_base) / SYNC_PLAN_GRID;
-    if (first >= view->bits || last >= view->bits || last - first >= 3U)
+    /* No separate block count: the payload bound checked above already caps
+     * the span, so the loop below runs at most payload_max/GRID + 1 times. */
+    if (first >= view->bits || last >= view->bits)
         return -1;
     start = map_base + first * SYNC_PLAN_GRID;
     if (start < view->cursor)

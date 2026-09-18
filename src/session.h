@@ -1207,6 +1207,13 @@ void session_set_liveness_unbound(session_t *s, int unbound);
  * active; structured events and the distinct /dev/tty title sink are not. */
 void session_set_shared_raw_display_tty(session_t *s, int shared);
 
+/* The suppression predicate itself. Nonzero while an automatic prose line
+ * written to stderr would land on the peer's rendered display and break
+ * peer-exactness. Exported because the sync engine emits gate-transition prose
+ * of its own and must apply the same rule; a second copy of the condition in
+ * another translation unit is how the two drift apart. */
+int session_async_terminal_text_suppressed(const session_t *s);
+
 /* Arm the bootstrap accept window: if the session is not ESTABLISHED
  * within `secs`, session_run returns -1 (mosh-server's 60s rule).
  * 0 disarms. */

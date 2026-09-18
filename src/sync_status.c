@@ -101,7 +101,10 @@ void sync_status_tracker_init(sync_status_tracker_t *tracker,
     tracker->last_sync_ms = -1;
     tracker->peer_snapshot_ms = -1;
     tracker->behind_since_ms = -1;
-    tracker->last_delivery_progress_ms = now_ms;
+    for (unsigned dir = 0; dir < SYNC_STATUS_DIR_COUNT; dir++) {
+        tracker->direction_behind_since_ms[dir] = -1;
+        tracker->last_direction_progress_ms[dir] = now_ms;
+    }
     tracker->state = SYNC_STATUS_OUT_OF_SYNC;
     tracker->next_title_refresh_ms = now_ms;
 }
@@ -126,7 +129,11 @@ void sync_status_tracker_set_epoch(sync_status_tracker_t *tracker,
     tracker->previous_behind_known = 0;
     tracker->previous_behind = 0;
     tracker->behind_since_ms = -1;
-    tracker->last_delivery_progress_ms = now_ms;
+    for (unsigned dir = 0; dir < SYNC_STATUS_DIR_COUNT; dir++) {
+        tracker->previous_direction_behind[dir] = 0;
+        tracker->direction_behind_since_ms[dir] = -1;
+        tracker->last_direction_progress_ms[dir] = now_ms;
+    }
     tracker->next_heartbeat_ms = now_ms;
     tracker->state = SYNC_STATUS_OUT_OF_SYNC;
     tracker->state_announced = 0;
@@ -169,22 +176,86 @@ static void compute_behind(const sync_status_tracker_t *tracker,
     *total_out = saturating_add_u64(outgoing, incoming);
 }
 
+/* The anchor a direction is measured against: the later of the moment its
+ * backlog opened and the last time that direction actually moved.  Returns -1
+ * when the direction has no anchor yet, which a caller must read as "nothing
+ * to be late for" rather than as an infinitely old one. */
+static int64_t direction_anchor(const sync_status_tracker_t *tracker,
+                                unsigned dir)
+{
+    int64_t anchor = tracker->direction_behind_since_ms[dir];
+
+    if (tracker->last_direction_progress_ms[dir] > anchor)
+        anchor = tracker->last_direction_progress_ms[dir];
+    return anchor;
+}
+
+/* One direction is stalled when it is known to be behind and its own anchor
+ * has gone quiet for the full threshold.  Deliberately independent per
+ * direction: a peer streaming output at us says nothing about whether our own
+ * bytes are still arriving there. */
+static int direction_stalled(const sync_status_tracker_t *tracker,
+                             unsigned dir, int behind_known,
+                             uint64_t direction_behind, int64_t now_ms)
+{
+    int64_t anchor;
+
+    if (!behind_known || direction_behind == 0)
+        return 0;
+    anchor = direction_anchor(tracker, dir);
+    if (anchor < 0)
+        return 0;
+    return nonnegative_age(now_ms, anchor) >= SYNC_STATUS_STALL_MS;
+}
+
+static void observe_direction(sync_status_tracker_t *tracker, unsigned dir,
+                              int64_t now_ms, int moved, int behind_known,
+                              uint64_t direction_behind)
+{
+    if (moved)
+        tracker->last_direction_progress_ms[dir] = now_ms;
+
+    if (behind_known && direction_behind > 0 &&
+        (!tracker->previous_behind_known ||
+         tracker->previous_direction_behind[dir] == 0)) {
+        /* A backlog that has only just opened is not late.  Start its clock
+         * here so the threshold measures this backlog rather than however
+         * long the direction happened to be idle beforehand.  The progress
+         * anchor is deliberately left alone: direction_anchor() already takes
+         * the later of the two, and opening a backlog is not evidence that
+         * anything was delivered. */
+        tracker->direction_behind_since_ms[dir] = now_ms;
+    } else if (behind_known && direction_behind == 0) {
+        tracker->direction_behind_since_ms[dir] = -1;
+    }
+    if (behind_known)
+        tracker->previous_direction_behind[dir] = direction_behind;
+}
+
 static void observe_local_progress(sync_status_tracker_t *tracker,
                                    int64_t now_ms,
                                    uint64_t local_rx_delivered,
-                                   int behind_known, uint64_t behind)
+                                   int behind_known, uint64_t outgoing,
+                                   uint64_t incoming, uint64_t behind)
 {
-    if (local_rx_delivered > tracker->observed_local_rx_delivered)
-        tracker->last_delivery_progress_ms = now_ms;
+    int incoming_moved =
+        local_rx_delivered > tracker->observed_local_rx_delivered;
+
     tracker->observed_local_rx_delivered = local_rx_delivered;
 
+    /* The outgoing direction moves only in sync_status_observe_peer, where a
+     * larger absolute peer rx_delivered proves the peer received our bytes.
+     * Nothing observable locally can advance it. */
+    observe_direction(tracker, SYNC_STATUS_DIR_OUTGOING, now_ms, 0,
+                      behind_known, outgoing);
+    observe_direction(tracker, SYNC_STATUS_DIR_INCOMING, now_ms,
+                      incoming_moved, behind_known, incoming);
+
     if (behind_known && behind > 0 &&
-        (!tracker->previous_behind_known || tracker->previous_behind == 0)) {
+        (!tracker->previous_behind_known || tracker->previous_behind == 0))
         tracker->behind_since_ms = now_ms;
-        tracker->last_delivery_progress_ms = now_ms;
-    } else if (behind_known && behind == 0) {
+    else if (behind_known && behind == 0)
         tracker->behind_since_ms = -1;
-    }
     tracker->previous_behind_known = behind_known;
     tracker->previous_behind = behind;
 }
@@ -198,28 +269,29 @@ int sync_status_evaluate(sync_status_tracker_t *tracker, int64_t now_ms,
     uint64_t outgoing, incoming, behind;
     int64_t authenticated_age;
     int64_t peer_age;
-    int64_t progress_anchor;
     sync_status_state_t next;
 
     if (!tracker || !tracker->active)
         return 0;
     compute_behind(tracker, local_tx_tip, local_rx_delivered,
                    local_rx_highest, &known, &outgoing, &incoming, &behind);
-    (void)outgoing;
-    (void)incoming;
-    observe_local_progress(tracker, now_ms, local_rx_delivered, known, behind);
+    observe_local_progress(tracker, now_ms, local_rx_delivered, known,
+                           outgoing, incoming, behind);
 
     authenticated_age = nonnegative_age(now_ms,
                                          tracker->last_authenticated_ms);
     peer_age = tracker->peer_valid
         ? nonnegative_age(now_ms, tracker->peer_snapshot_ms) : -1;
-    progress_anchor = tracker->behind_since_ms;
-    if (tracker->last_delivery_progress_ms > progress_anchor)
-        progress_anchor = tracker->last_delivery_progress_ms;
 
+    /* Either direction alone is enough.  This is a strict superset of the
+     * former single-anchor test: that anchor was the later of the two, so any
+     * case it caught left both directions quiet, and whichever one was behind
+     * is caught here too. */
     if (authenticated_age >= SYNC_STATUS_STALL_MS ||
-        (known && behind > 0 && progress_anchor >= 0 &&
-         nonnegative_age(now_ms, progress_anchor) >= SYNC_STATUS_STALL_MS)) {
+        direction_stalled(tracker, SYNC_STATUS_DIR_OUTGOING, known,
+                          outgoing, now_ms) ||
+        direction_stalled(tracker, SYNC_STATUS_DIR_INCOMING, known,
+                          incoming, now_ms)) {
         next = SYNC_STATUS_STALLED;
     } else if (known && peer_age >= 0 &&
                peer_age < SYNC_STATUS_STALL_MS && behind == 0) {
@@ -257,8 +329,12 @@ int sync_status_observe_peer(sync_status_tracker_t *tracker,
         tracker->peer_tx_tip = local_rx_delivered;
     if (!tracker->peer_valid ||
         record->rx_delivered > tracker->peer_rx_delivered) {
+        /* The one event that proves our bytes are still arriving there.  A
+         * heartbeat repeating the same absolute count proves only that the
+         * peer is alive, so it must not move this anchor. */
         if (record->rx_delivered > tracker->observed_peer_rx_delivered)
-            tracker->last_delivery_progress_ms = now_ms;
+            tracker->last_direction_progress_ms[SYNC_STATUS_DIR_OUTGOING] =
+                now_ms;
         tracker->peer_rx_delivered = record->rx_delivered;
     }
     tracker->observed_peer_rx_delivered = tracker->peer_rx_delivered;
@@ -282,8 +358,8 @@ void sync_status_snapshot(sync_status_tracker_t *tracker, int64_t now_ms,
 {
     int known;
     uint64_t outgoing, incoming, behind;
-    int64_t progress_anchor;
-    int64_t progress_age;
+    uint64_t dir_behind[SYNC_STATUS_DIR_COUNT];
+    unsigned dir;
 
     if (!tracker || !view_out)
         return;
@@ -307,14 +383,35 @@ void sync_status_snapshot(sync_status_tracker_t *tracker, int64_t now_ms,
     view_out->last_sync_age_ms = nonnegative_age(now_ms,
                                                  tracker->last_sync_ms);
 
-    progress_anchor = tracker->behind_since_ms;
-    if (tracker->last_delivery_progress_ms > progress_anchor)
-        progress_anchor = tracker->last_delivery_progress_ms;
-    progress_age = progress_anchor >= 0
-        ? nonnegative_age(now_ms, progress_anchor) : 0;
+    dir_behind[SYNC_STATUS_DIR_OUTGOING] = outgoing;
+    dir_behind[SYNC_STATUS_DIR_INCOMING] = incoming;
     view_out->stalled_age_ms = view_out->authenticated_age_ms;
-    if (known && behind > 0 && progress_age > view_out->stalled_age_ms)
-        view_out->stalled_age_ms = progress_age;
+    view_out->outgoing_progress_age_ms = -1;
+    view_out->incoming_progress_age_ms = -1;
+
+    for (dir = 0; dir < SYNC_STATUS_DIR_COUNT; dir++) {
+        int64_t anchor;
+        int64_t age;
+
+        if (!known || dir_behind[dir] == 0)
+            continue;
+        anchor = direction_anchor(tracker, dir);
+        if (anchor < 0)
+            continue;
+        age = nonnegative_age(now_ms, anchor);
+        if (dir == SYNC_STATUS_DIR_OUTGOING)
+            view_out->outgoing_progress_age_ms = age;
+        else
+            view_out->incoming_progress_age_ms = age;
+        /* The reported age is the worst direction, not a blend: an operator
+         * chasing a stall wants the side that is furthest behind. */
+        if (age > view_out->stalled_age_ms)
+            view_out->stalled_age_ms = age;
+        if (age >= SYNC_STATUS_STALL_MS)
+            view_out->stalled_directions |=
+                dir == SYNC_STATUS_DIR_OUTGOING
+                    ? SYNC_STATUS_STALL_OUTGOING : SYNC_STATUS_STALL_INCOMING;
+    }
 }
 
 int sync_status_heartbeat_due(const sync_status_tracker_t *tracker,
@@ -353,13 +450,21 @@ static int64_t sync_status_deadline(const sync_status_tracker_t *tracker,
             deadline = peer_deadline;
     }
     if (tracker->state != SYNC_STATUS_STALLED &&
-        tracker->previous_behind_known && tracker->previous_behind > 0) {
-        int64_t progress_anchor = tracker->behind_since_ms;
-        if (tracker->last_delivery_progress_ms > progress_anchor)
-            progress_anchor = tracker->last_delivery_progress_ms;
-        if (progress_anchor >= 0 &&
-            progress_anchor + SYNC_STATUS_STALL_MS < deadline)
-            deadline = progress_anchor + SYNC_STATUS_STALL_MS;
+        tracker->previous_behind_known) {
+        unsigned dir;
+
+        /* Wake for whichever direction reaches the threshold first; taking
+         * only the fused anchor would sleep past a direction that has been
+         * quiet while the other one kept moving. */
+        for (dir = 0; dir < SYNC_STATUS_DIR_COUNT; dir++) {
+            int64_t anchor;
+
+            if (tracker->previous_direction_behind[dir] == 0)
+                continue;
+            anchor = direction_anchor(tracker, dir);
+            if (anchor >= 0 && anchor + SYNC_STATUS_STALL_MS < deadline)
+                deadline = anchor + SYNC_STATUS_STALL_MS;
+        }
     }
     if (!include_heartbeat && tracker->state != SYNC_STATUS_SYNC &&
         tracker->next_title_refresh_ms < deadline)
