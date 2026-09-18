@@ -87,6 +87,35 @@ multiplexer, a recursive filesystem synchronizer, or a hardened multi-user
 daemon. SSH reachability alone is insufficient: the client must also be able
 to reach the UDP port selected by the remote listener.
 
+## Compared to mosh
+
+Mosh solved the roaming terminal first. On a slow link it still feels faster,
+because it echoes your keystrokes before the server confirms them. Unmoor does
+not do that.
+
+The real difference is what each tool treats as the terminal.
+
+Mosh syncs the screen. If output comes faster than the network, the older
+output is never sent, and nothing tells you what you missed. Unmoor sends the
+stream. Once a byte is admitted it is delivered or kept for repair, and the
+client shows `SYNC`, `OUT-OF-SYNC` or `STALLED`.
+
+Two results:
+
+- Your terminal's normal scrollback, search and copy work, because the bytes
+  really arrive.
+- Someone who breaks the path can stop output reaching you. They cannot leave
+  you believing you saw all of it. [`SECURITY.md`](SECURITY.md) says what an
+  on-path attacker can still do.
+
+The price is real. When the backlog fills, the command that is printing blocks
+until the receiver catches up. Mosh would skip ahead. If you want speed on a
+bad link more than the full stream, use mosh.
+
+I wrote the lossy version first. [URTB](https://github.com/nmicic/URTB) drops
+output under pressure because a LoRa link gives no choice. That is right
+there. A network path does not have that limit, so Unmoor does not repeat it.
+
 ## How this was built
 
 Unmoor is an end-to-end AI-assisted project. The specification, the C

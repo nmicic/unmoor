@@ -204,10 +204,14 @@ the SPDX identifier; none were missing.
 
 `README.md`, `HOWTO.md`, `SECURITY.md` and this file were written for a reader
 who has only this tree. The development tree has files with three of those
-names; they are internal documents, and none of their prose was carried over.
-Checked rather than assumed: across the three, the only lines that appear
-verbatim in both are the copyright comment, three Markdown headings and the
-code-fence markers.
+names; they are internal documents, and their prose was not carried over, with
+one deliberate exception. The `## Compared to mosh` section is held identical
+in both READMEs: it answers a question that a reader of either tree asks, and
+two drifting answers to it would be worse than one.
+
+Checked rather than assumed: apart from that section's 21 lines, the only
+lines that appear verbatim in both are the copyright comment, three Markdown
+headings and the code-fence markers.
 
 The `Makefile` (120 lines, against 1377 in the development tree), `.gitignore`,
 the CI workflow, the five `bin/` wrappers, `tests/hygiene.sh`, `tests/smoke.py`
