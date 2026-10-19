@@ -238,13 +238,17 @@ int reasm_feed_fragment(reasm_t *r,
 
     uint32_t bit = UINT32_C(1) << d->index;
     size_t offset = (size_t)d->index * d->stride;
+    /* descriptor_valid refused an empty payload above, so len is never
+     * zero here; the guards keep the C library's non-null contract for
+     * memcmp and memcpy visible to a static analyzer. */
     if (slot->received & bit) {
-        if (memcmp(slot->buf + offset, data, len) != 0)
+        if (len != 0 && memcmp(slot->buf + offset, data, len) != 0)
             return reject_identity(r, slot, direction, channel, d->message_id);
         return REASM_DROP;
     }
 
-    memcpy(slot->buf + offset, data, len);
+    if (len != 0)
+        memcpy(slot->buf + offset, data, len);
     slot->received |= bit;
 
     uint32_t wanted = d->count == 32 ? UINT32_MAX

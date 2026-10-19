@@ -150,7 +150,7 @@ static int forge_counter_frame_under(const uint8_t key[32],
 {
     uint8_t ad[10];
     uint8_t nonce[24];
-    uint8_t ct[1];
+    uint8_t ct[1] = {0};
     uint8_t mac[16];
     int encoded;
 
