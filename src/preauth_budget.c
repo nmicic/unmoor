@@ -291,3 +291,9 @@ void preauth_budget_note_malformed(preauth_budget_t *budget)
     if (budget)
         increment_saturating(&budget->counters.malformed_preauth_drop);
 }
+
+void preauth_budget_note_no_key(preauth_budget_t *budget)
+{
+    if (budget)
+        increment_saturating(&budget->counters.no_key_drop);
+}

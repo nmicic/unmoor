@@ -103,6 +103,17 @@ static void build_nonce(uint8_t direction, uint32_t seq, uint8_t nonce[24])
     nonce[4] = (uint8_t)((seq >> 24) & 0xFF);
 }
 
+/* An all-zero key is never a live key here: every AEAD key is KDF output
+ * or a wiped buffer. Refusing it makes an upstream selection mistake fail
+ * closed instead of authenticating anything built with the zero key. */
+static int key_is_zero(const uint8_t key[32])
+{
+    uint8_t acc = 0;
+    for (size_t i = 0; i < 32; i++)
+        acc |= key[i];
+    return acc == 0;
+}
+
 /* -------------------------------------------------------------------------
  * AEAD encrypt
  * Wire format: ciphertext_out = cipher_text || mac[16]
@@ -117,7 +128,7 @@ int crypto_encrypt_ad(const uint8_t key[32],
 {
     if (!key || (!ad && ad_len != 0) ||
         (!plaintext && plaintext_len != 0) || !ciphertext_out ||
-        !ciphertext_len_out)
+        !ciphertext_len_out || key_is_zero(key))
         return -1;
 
     uint8_t nonce[24];
@@ -165,7 +176,9 @@ int crypto_decrypt_ad(const uint8_t key[32],
                       uint8_t *plaintext_out, size_t *plaintext_len_out)
 {
     if (!key || (!ad && ad_len != 0) || !ciphertext || !plaintext_out ||
-        !plaintext_len_out || ciphertext_len < 16) {
+        !plaintext_len_out || key_is_zero(key))
+        return -1;
+    if (ciphertext_len < 16) {
         fprintf(stderr, "crypto_decrypt: ciphertext too short (%zu)\n",
                 ciphertext_len);
         return -1;
@@ -184,7 +197,7 @@ int crypto_decrypt_ad(const uint8_t key[32],
 
     if (r != 0) return -1;  /* auth failure */
 
-    if (plaintext_len_out) *plaintext_len_out = pt_len;
+    *plaintext_len_out = pt_len;
     return 0;
 }
 
@@ -291,6 +304,9 @@ int crypto_encrypt_with_nonce(const uint8_t key[32],
                               uint8_t *ciphertext_out, size_t *ciphertext_len_out)
 {
     uint8_t mac[16];
+    if (!key || !nonce || !ad || (!plaintext && plaintext_len != 0) ||
+        !ciphertext_out || key_is_zero(key))
+        return -1;
     crypto_aead_lock(ciphertext_out, mac,
                      key, nonce,
                      ad, 10,
@@ -308,6 +324,9 @@ int crypto_decrypt_with_nonce(const uint8_t key[32],
                               const uint8_t *ciphertext, size_t ciphertext_len,
                               uint8_t *plaintext_out, size_t *plaintext_len_out)
 {
+    if (!key || !nonce || !ad || !ciphertext || !plaintext_out ||
+        !plaintext_len_out || key_is_zero(key))
+        return -1;
     if (ciphertext_len < 16) {
         fprintf(stderr, "crypto_decrypt_with_nonce: ciphertext too short (%zu)\n",
                 ciphertext_len);
@@ -322,7 +341,7 @@ int crypto_decrypt_with_nonce(const uint8_t key[32],
                                ciphertext, pt_len);
     if (r != 0) return -1;
 
-    if (plaintext_len_out) *plaintext_len_out = pt_len;
+    *plaintext_len_out = pt_len;
     return 0;
 }
 

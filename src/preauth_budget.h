@@ -40,6 +40,7 @@ typedef struct {
     uint64_t aead_failure;
     uint64_t budget_drop;
     uint64_t table_full_drop;
+    uint64_t no_key_drop;
 } preauth_counters_t;
 
 typedef struct {
@@ -87,5 +88,7 @@ void preauth_budget_authenticated(preauth_budget_t *budget,
                                   const preauth_budget_handle_t *handle);
 void preauth_budget_note_unknown_pair(preauth_budget_t *budget);
 void preauth_budget_note_malformed(preauth_budget_t *budget);
+/* A frame whose selected key is not live is dropped before admission. */
+void preauth_budget_note_no_key(preauth_budget_t *budget);
 
 #endif /* UNMOOR_PREAUTH_BUDGET_H */

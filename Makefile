@@ -44,14 +44,18 @@ endif
 SRCS := $(sort $(wildcard src/*.c)) src/vendor/monocypher.c \
     src/vendor/mlkem-native/mlkem/mlkem_native.c
 OBJS := $(addprefix $(BUILD)/,$(SRCS:.c=.o))
+# Product objects without the program entry point, for session-level tests.
+CORE_OBJS := $(filter-out $(BUILD)/src/main.o,$(OBJS))
 FRAME_SRCS := tools/frame_test.c src/frame.c src/reasm.c src/crypto.c \
     src/negotiation.c src/vendor/monocypher.c
 PQ_SRCS := tools/pq_crypto_test.c src/pq_crypto.c src/crypto.c \
     src/vendor/monocypher.c src/vendor/mlkem-native/mlkem/mlkem_native.c
 FRAME_OBJS := $(addprefix $(BUILD)/,$(FRAME_SRCS:.c=.o))
 PQ_OBJS := $(addprefix $(BUILD)/,$(PQ_SRCS:.c=.o))
-ALL_OBJS := $(sort $(OBJS) $(FRAME_OBJS) $(PQ_OBJS))
-TESTS := $(BUILD)/frame_test $(BUILD)/pq_crypto_test
+KEY_GATE_OBJS := $(BUILD)/tools/session_key_gate_test.o
+ALL_OBJS := $(sort $(OBJS) $(FRAME_OBJS) $(PQ_OBJS) $(KEY_GATE_OBJS))
+TESTS := $(BUILD)/frame_test $(BUILD)/pq_crypto_test \
+    $(BUILD)/session_key_gate_test
 
 .PHONY: all check test smoke hygiene shell-syntax clean bundle unmoor-static help
 all: unmoor
@@ -69,9 +73,14 @@ $(BUILD)/frame_test: $(FRAME_OBJS)
 $(BUILD)/pq_crypto_test: $(PQ_OBJS)
 	$(CC) $(CFLAGS) -o $@ $(PQ_OBJS) $(LDFLAGS)
 
+# Drives the production session through an in-memory transport.
+$(BUILD)/session_key_gate_test: $(KEY_GATE_OBJS) $(CORE_OBJS)
+	$(CC) $(CFLAGS) -o $@ $(KEY_GATE_OBJS) $(CORE_OBJS) $(LDFLAGS) $(LDLIBS)
+
 test: $(TESTS)
 	$(BUILD)/frame_test
 	$(BUILD)/pq_crypto_test
+	$(BUILD)/session_key_gate_test
 
 hygiene: unmoor
 	sh tests/hygiene.sh ./unmoor

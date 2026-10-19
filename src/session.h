@@ -514,6 +514,11 @@ struct session {
     /* Explicit flag: session_key has been derived (replaces has_key heuristic) */
     int     have_session_key;
 
+    /* Explicit flag: hello_key holds live bootstrap material. Every wipe of
+     * hello_key clears it, so a zeroed buffer is never selected as an AEAD
+     * key in either direction. */
+    int     have_hello_key;
+
     /* Stashed frame buffered in CONNECTING (e.g., early CTRL_READY) to be
      * decrypted after handle_hello_ack derives session_key. */
     int      stashed_valid;

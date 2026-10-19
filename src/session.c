@@ -4412,7 +4412,9 @@ void session_wipe_key_material(session_t *s)
     if (!s) return;
     crypto_memzero(s->psk, sizeof(s->psk));
     crypto_memzero(s->hello_key, sizeof(s->hello_key));
+    s->have_hello_key = 0;
     crypto_memzero(s->session_key, sizeof(s->session_key));
+    s->have_session_key = 0;
     crypto_memzero(s->pending_key, sizeof(s->pending_key));
     crypto_memzero(s->rekey_private, sizeof(s->rekey_private));
     crypto_memzero(s->nonce_a, sizeof(s->nonce_a));
@@ -5086,10 +5088,14 @@ static int wire_encode_authenticated_intent(session_t *s,
         key = s->pending_key;
         tx_seq = &s->pending_tx_seq;
     } else if (intent->epoch_source == SESSION_TX_EPOCH_HELLO_KEY) {
+        if (!s->have_hello_key)
+            return -1;
         pair_id = s->pair_id;
         key = s->hello_key;
         tx_seq = &s->tx_seq;
     } else {
+        if (!s->have_session_key)
+            return -1;
         pair_id = s->pair_id;
         key = s->session_key;
         tx_seq = &s->tx_seq;
@@ -10543,12 +10549,19 @@ static int send_ctrl_error(session_t *s, uint16_t code)
 {
     const uint8_t *key = NULL;
     if (s->state == SESSION_CONNECTING) {
+        if (!s->have_hello_key)
+            return 0;
         key = s->hello_key;
     } else if (s->state == SESSION_KEY_DERIVING ||
                s->state == SESSION_ESTABLISHED ||
                s->state == SESSION_REKEYING ||
                s->state == SESSION_CLOSING) {
-        key = s->have_session_key ? s->session_key : s->hello_key;
+        if (s->have_session_key)
+            key = s->session_key;
+        else if (s->have_hello_key)
+            key = s->hello_key;
+        else
+            return 0;
     } else {
         return 0;
     }
@@ -10742,6 +10755,7 @@ static void enter_idle(session_t *s)
     s->multipath_mismatch_count = 0U;
     crypto_memzero(s->session_key,       32);
     crypto_memzero(s->hello_key,         32);  /* Wipe hello_key too */
+    s->have_hello_key = 0;
     crypto_memzero(s->nonce_a,           16);
     crypto_memzero(s->nonce_b,           16);
     pending_epoch_clear(s);
@@ -10913,6 +10927,7 @@ int session_connect(session_t *s)
         enter_idle(s);
         return -1;
     }
+    s->have_hello_key = 1;
 
     /* Generate nonce_a for this handshake attempt */
     if (crypto_random_bytes(s->nonce_a, 16) != 0) {
@@ -10989,6 +11004,7 @@ int session_listen(session_t *s)
         enter_idle(s);
         return -1;
     }
+    s->have_hello_key = 1;
     s->state = SESSION_IDLE;
     fprintf(stderr, "session: server mode, waiting for CTRL_HELLO\n");
     return 0;
@@ -11478,6 +11494,7 @@ static void establish_session(session_t *s)
              * server's longer retry obligation. */
             crypto_memzero(s->psk, sizeof(s->psk));
             crypto_memzero(s->hello_key, sizeof(s->hello_key));
+            s->have_hello_key = 0;
         }
         if (s->bootstrap_rekey_required) {
             s->state = SESSION_REKEYING;
@@ -11798,6 +11815,7 @@ static void handle_hello_ack(session_t *s,
          * READY proves the cached HELLO_ACK is no longer needed. */
         crypto_memzero(s->psk, sizeof(s->psk));
         crypto_memzero(s->hello_key, sizeof(s->hello_key));
+        s->have_hello_key = 0;
     }
 
     s->state = SESSION_KEY_DERIVING;
@@ -14545,6 +14563,11 @@ void session_replay_stashed_frame_at(session_t *s, int64_t preauth_now_ms)
         preauth_budget_note_malformed(&s->preauth_budget);
         goto out;
     }
+    if (!s->have_session_key) {
+        /* A stashed frame can only be replayed under a derived key. */
+        preauth_budget_note_no_key(&s->preauth_budget);
+        goto out;
+    }
     if (session_preauth_admit(
             s, s->stashed_source_valid ? &s->stashed_source : NULL,
             s->stashed_source_required, preauth_now_ms,
@@ -14815,21 +14838,36 @@ static void process_frame_impl(session_t *s, const uint8_t *frame,
     ad[8] = chan_byte;
     ad[9] = type;
 
-    /* Determine which key to use for decryption */
+    /* Determine which key to use for decryption. The pair id decides the
+     * epoch first: a pending-epoch frame proves possession of the pending
+     * key and nothing else, so its control type never selects the
+     * bootstrap key. Only the current epoch carries the two hello frames. */
     const uint8_t *decrypt_key = NULL;
-    int is_hello_frame = (!selected_pending_epoch && chan_id == 0 &&
-                          (type == CTRL_HELLO || type == CTRL_HELLO_ACK));
+    int is_hello_frame = 0;
 
-    /* Server receives CTRL_HELLO with hello_key */
-    /* Client receives CTRL_HELLO_ACK with hello_key */
-    if (chan_id == 0 && type == CTRL_HELLO && s->is_server) {
+    if (selected_pending_epoch) {
+        decrypt_key = s->pending_key;
+    } else if (chan_id == 0 && type == CTRL_HELLO && s->is_server) {
+        /* Server receives CTRL_HELLO with hello_key */
         decrypt_key = s->hello_key;
+        is_hello_frame = 1;
     } else if (chan_id == 0 && type == CTRL_HELLO_ACK && !s->is_server) {
+        /* Client receives CTRL_HELLO_ACK with hello_key */
         decrypt_key = s->hello_key;
+        is_hello_frame = 1;
     } else {
-        decrypt_key = selected_pending_epoch ? s->pending_key
-                                             : s->session_key;
-        is_hello_frame = 0;
+        decrypt_key = s->session_key;
+    }
+
+    /* Never verify under a buffer that holds no live key. A wiped or
+     * not-yet-derived key is all zero, and an all-zero key authenticates
+     * any forgery built with it. Session frames that arrive before the
+     * session key exists are only kept by the CONNECTING stash below. */
+    if (is_hello_frame ? !s->have_hello_key
+                       : (!selected_pending_epoch && !s->have_session_key &&
+                          s->state != SESSION_CONNECTING)) {
+        preauth_budget_note_no_key(&s->preauth_budget);
+        return;
     }
 
     /* For CTRL_HELLO/CTRL_HELLO_ACK: direction is fixed */
