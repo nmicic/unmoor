@@ -13,6 +13,11 @@
  *          it are one complete Unmoor frame, with nothing wrapped around it.
  */
 
+#if defined(__APPLE__)
+#define _DARWIN_C_SOURCE
+#else
+#define _GNU_SOURCE
+#endif
 #define _POSIX_C_SOURCE 200809L
 
 #include <errno.h>
@@ -45,6 +50,30 @@ typedef struct {
     transport_stream_tx_t tx;
     transport_stats_t stats;
 } transport_unix_t;
+
+/* The listener hands the session to exactly one peer, and that peer must be
+ * this user. The 0600 inode is the first line; the credential check holds
+ * when a directory race or a lenient platform default gets past it. */
+static int unix_peer_is_same_user(int fd)
+{
+#if defined(__linux__) && defined(SO_PEERCRED)
+    struct ucred peer;
+    socklen_t length = sizeof(peer);
+
+    memset(&peer, 0, sizeof(peer));
+    if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &peer, &length) != 0 ||
+        length != sizeof(peer))
+        return 0;
+    return peer.uid == geteuid();
+#else
+    uid_t uid = (uid_t)-1;
+    gid_t gid = (gid_t)-1;
+
+    if (getpeereid(fd, &uid, &gid) != 0)
+        return 0;
+    return uid == geteuid();
+#endif
+}
 
 static void unix_log_send_failure(transport_unix_t *t, int error)
 {
@@ -205,14 +234,47 @@ static int unix_open(const transport_config_t *cfg, transport_t **out)
     t->base.ops = &transport_unix;
     t->fd = -1;
     t->listen_fd = -1;
+    {
+        struct sockaddr_un probe;
+        size_t path_len = strlen(cfg->path);
+
+        if (path_len >= sizeof(probe.sun_path) ||
+            path_len >= sizeof(t->path)) {
+            fprintf(stderr, "transport_unix: path too long: %s\n",
+                    cfg->path);
+            free(t);
+            return -1;
+        }
+    }
     snprintf(t->path, sizeof(t->path), "%s", cfg->path);
 
     if (cfg->listen) {
+        struct stat existing;
+        mode_t previous_umask;
+        int bind_rc;
+        int bind_error;
+
         /* Listener mode */
         t->is_listener = 1;
 
-        /* Unlink existing socket */
-        unlink(cfg->path);
+        /* Replace only a stale socket of our own. A regular file, a
+         * directory or a symlink at the path is left alone. */
+        if (lstat(cfg->path, &existing) == 0) {
+            if (!S_ISSOCK(existing.st_mode) ||
+                existing.st_uid != geteuid()) {
+                fprintf(stderr,
+                        "transport_unix: %s exists and is not our socket\n",
+                        cfg->path);
+                free(t);
+                return -1;
+            }
+            (void)unlink(cfg->path);
+        } else if (errno != ENOENT) {
+            fprintf(stderr, "transport_unix: lstat(%s): %s\n", cfg->path,
+                    strerror(errno));
+            free(t);
+            return -1;
+        }
 
         t->listen_fd = socket(AF_UNIX, SOCK_STREAM, 0);
         if (t->listen_fd < 0) {
@@ -226,8 +288,14 @@ static int unix_open(const transport_config_t *cfg, transport_t **out)
         addr.sun_family = AF_UNIX;
         snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", cfg->path);
 
-        if (bind(t->listen_fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
-            fprintf(stderr, "transport_unix: bind(%s): %s\n", cfg->path, strerror(errno));
+        /* The inode is born 0600; the chmod below only confirms it. */
+        previous_umask = umask(0077);
+        bind_rc = bind(t->listen_fd, (struct sockaddr *)&addr, sizeof(addr));
+        bind_error = errno;
+        (void)umask(previous_umask);
+        if (bind_rc != 0) {
+            fprintf(stderr, "transport_unix: bind(%s): %s\n", cfg->path,
+                    strerror(bind_error));
             close(t->listen_fd);
             free(t);
             return -1;
@@ -257,6 +325,16 @@ static int unix_open(const transport_config_t *cfg, transport_t **out)
         t->fd = accept(t->listen_fd, NULL, NULL);
         if (t->fd < 0) {
             fprintf(stderr, "transport_unix: accept: %s\n", strerror(errno));
+            close(t->listen_fd);
+            unlink(cfg->path);
+            free(t);
+            return -1;
+        }
+        if (!unix_peer_is_same_user(t->fd)) {
+            fprintf(stderr,
+                    "transport_unix: rejecting a connection from another "
+                    "user\n");
+            close(t->fd);
             close(t->listen_fd);
             unlink(cfg->path);
             free(t);
@@ -417,7 +495,7 @@ static int unix_recv(transport_t *base, uint8_t *buf, size_t max, int timeout_ms
     if (rr < 0) return -1;
 
     size_t body_len = (size_t)hdr[0] | ((size_t)hdr[1] << 8);
-    /* Cap body_len at FRAME_MAX_LEN (510) and caller's max.
+    /* Cap body_len at FRAME_MAX_LEN and the caller's max.
      * If oversized, drain the bytes from the socket before returning so we
      * don't leave the stream mid-frame (framing corruption). */
     if (body_len > max || body_len > FRAME_MAX_LEN) {

@@ -751,6 +751,7 @@ static int default_parent_path(char out[PATH_MAX])
 
 static int open_listener_log(const char *log_path)
 {
+    struct stat state;
     int logfd;
 
     if (log_path == NULL) {
@@ -762,6 +763,19 @@ static int open_listener_log(const char *log_path)
                  0600);
     if (logfd < 0)
         return -1;
+    /* O_NOFOLLOW covers only the final component. A FIFO, a device or
+     * another user's file planted at the path is not a log of ours. */
+    if (fstat(logfd, &state) != 0) {
+        int cause = errno;
+        (void)close(logfd);
+        errno = cause;
+        return -1;
+    }
+    if (!S_ISREG(state.st_mode) || state.st_uid != geteuid()) {
+        (void)close(logfd);
+        errno = EPERM;
+        return -1;
+    }
     if (fchmod(logfd, 0600) != 0) {
         int cause = errno;
         (void)close(logfd);

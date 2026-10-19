@@ -586,14 +586,25 @@ static int cmd_child_transfer_lease(int argc, char *argv[])
  * listen/connect: take the key, open the transport, run the session
  * ---------------------------------------------------------------------- */
 
-/* Decode 64 hex chars into 32 bytes. Returns 0 on success. */
+static int hex_nibble_value(char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+/* Decode exactly 64 hex digits into 32 bytes. Returns 0 on success. No
+ * sign, whitespace or 0x prefix is accepted: a lenient parser would let a
+ * malformed key pass as a different key. */
 static int hex32_decode(const char *hex, uint8_t out[32])
 {
     if (strlen(hex) != 64) return -1;
     for (int i = 0; i < 32; i++) {
-        unsigned v;
-        if (sscanf(hex + 2 * i, "%2x", &v) != 1) return -1;
-        out[i] = (uint8_t)v;
+        int high = hex_nibble_value(hex[2 * i]);
+        int low = hex_nibble_value(hex[2 * i + 1]);
+        if (high < 0 || low < 0) return -1;
+        out[i] = (uint8_t)((high << 4) | low);
     }
     return 0;
 }
@@ -2720,6 +2731,14 @@ static int cmd_session(int argc, char *argv[], int is_listen)
 
     char *env_key = getenv("UNMOOR_KEY");
     if (bootstrap_mode) {
+        if (env_key) {
+            /* The bootstrap key is generated below. An ambient UNMOOR_KEY
+             * is not used and must not reach the shell this session
+             * spawns. */
+            crypto_memzero(env_key, strlen(env_key));
+            unsetenv("UNMOOR_KEY");
+            env_key = NULL;
+        }
         /* Ephemeral key, never touches disk. Printed once on stdout for
          * the ssh channel to carry (mosh-server's model). */
         if (crypto_random_bytes(psk, 32) != 0 ||
@@ -3100,9 +3119,11 @@ static int cmd_session(int argc, char *argv[], int is_listen)
 
             int bsecs = 60;
             const char *bt = getenv("UNMOOR_BOOTSTRAP_TIMEOUT_SECS");
-            if (bt) {
-                int v = atoi(bt);
-                if (v > 0) bsecs = v;
+            if (bt && parse_positive_int(bt, 86400, &bsecs) != 0) {
+                bsecs = 60;
+                fprintf(stderr,
+                        "session: ignoring UNMOOR_BOOTSTRAP_TIMEOUT_SECS "
+                        "(want 1..86400 seconds)\n");
             }
             session_set_bootstrap_timeout(s, bsecs);
             fprintf(stderr, "session: bootstrap: detached (pid %ld), "

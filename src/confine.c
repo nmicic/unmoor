@@ -1174,24 +1174,58 @@ int confine_seccomp_arch_supported(void)
 
 #define CONFINE_MAX_FILTER 512U
 
+/* The SIGSYS report is assembled by hand: the handler runs after the filter
+ * refused a call, and only async-signal-safe work is allowed there. */
+static size_t sigsys_append(char *buffer, size_t capacity, size_t length,
+                            const char *text)
+{
+    while (*text != '\0' && length + 1U < capacity)
+        buffer[length++] = *text++;
+    return length;
+}
+
+static size_t sigsys_append_number(char *buffer, size_t capacity,
+                                   size_t length, long number)
+{
+    char digits[24];
+    size_t count = 0U;
+    unsigned long magnitude;
+
+    if (number < 0) {
+        length = sigsys_append(buffer, capacity, length, "-");
+        magnitude = (unsigned long)(-(number + 1)) + 1UL;
+    } else {
+        magnitude = (unsigned long)number;
+    }
+    do {
+        digits[count++] = (char)('0' + (int)(magnitude % 10UL));
+        magnitude /= 10UL;
+    } while (magnitude != 0UL && count < sizeof(digits));
+    while (count > 0U && length + 1U < capacity)
+        buffer[length++] = digits[--count];
+    return length;
+}
+
 static void confine_sigsys_handler(int signal_number, siginfo_t *info,
                                    void *context)
 {
     char message[96];
-    int length;
+    size_t length = 0U;
+    ssize_t written;
 
     (void)signal_number;
     (void)context;
     if (g_panic_hook != NULL)
         g_panic_hook();
-    length = snprintf(message, sizeof(message),
-                      "\r\nunmoor: confine: syscall %d denied\r\n",
-                      info != NULL ? info->si_syscall : -1);
-    if (length > 0) {
-        ssize_t written = write(STDERR_FILENO, message, (size_t)length);
-
-        (void)written;
-    }
+    length = sigsys_append(message, sizeof(message), length,
+                           "\r\nunmoor: confine: syscall ");
+    length = sigsys_append_number(message, sizeof(message), length,
+                                  info != NULL ? (long)info->si_syscall
+                                               : -1L);
+    length = sigsys_append(message, sizeof(message), length,
+                           " denied\r\n");
+    written = write(STDERR_FILENO, message, length);
+    (void)written;
     _exit(128 + SIGSYS);
 }
 
@@ -1201,7 +1235,10 @@ static int confine_install_sigsys_handler(void)
 
     memset(&action, 0, sizeof(action));
     action.sa_sigaction = confine_sigsys_handler;
-    action.sa_flags = SA_SIGINFO | SA_NODEFER;
+    /* SIGSYS stays blocked while the handler runs. Should the handler's own
+     * write be refused by the filter, the kernel falls back to the default
+     * action and the process dies instead of re-entering the handler. */
+    action.sa_flags = SA_SIGINFO;
     sigemptyset(&action.sa_mask);
     return sigaction(SIGSYS, &action, NULL);
 }
@@ -2095,8 +2132,16 @@ int confine_apply(const char *command, confine_role_t role)
         return -1;
     }
     if (role == CONFINE_ROLE_TERMINAL_CLIENT &&
-        confine_add_cwd_root(command) != 0)
-        return g_plan.level == CONFINE_LEVEL_REQUIRE ? -1 : 0;
+        confine_add_cwd_root(command) != 0) {
+        if (g_plan.level == CONFINE_LEVEL_REQUIRE)
+            return -1;
+        fprintf(stderr,
+                "%s: confine: the working directory could not be added to "
+                "the filesystem policy; continuing without confinement "
+                "under --confine=best-effort\n",
+                command);
+        return 0;
+    }
 
     /* LeakSanitizer needs ptrace, tgkill, process_vm_readv and
      * /proc/self/maps at exit; confinement and a sanitizer build cannot both

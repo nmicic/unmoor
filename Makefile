@@ -35,6 +35,9 @@ endif
 ifneq ($(filter-out 0,$(UNMOOR_CHAOS)),)
   $(error UNMOOR_CHAOS is not a build option here: this Makefile builds the product only)
 endif
+ifneq ($(findstring UNMOOR_CHAOS,$(CPPFLAGS) $(CFLAGS)),)
+  $(error UNMOOR_CHAOS must not be injected through CPPFLAGS or CFLAGS: this Makefile builds the product only)
+endif
 ifneq ($(strip $(ASAN)),)
   $(error ASAN is not a build option here. To build with sanitizers, add the flags to CFLAGS and LDFLAGS yourself; the confinement policy will need exceptions for the sanitizer runtime)
 endif
