@@ -13,9 +13,12 @@
  * client-confinement rule: an allow-list one syscall short of the truth is fatal, so the
  * groups are deliberately generous about syscalls that cannot widen the
  * process's authority (Landlock is the filesystem authority, not seccomp) and
- * strict about the ones that can: execve, clone, ptrace, mount, chroot,
- * set*uid, bpf, kexec, module loading, keyctl and process_vm_* appear in no
- * group at all.
+ * strict about the ones that can: ptrace, mount, chroot, set*uid, bpf,
+ * kexec, module loading, keyctl and process_vm_* appear in no group at all.
+ * clone and execve live only in confine_group_exec, which the terminal
+ * client alone receives; what they can start is bounded by Landlock execute
+ * rights on the binary's own image and the loader paths plus no_new_privs,
+ * not by seccomp.
  */
 #ifndef UNMOOR_CONFINE_TABLES_H
 #define UNMOOR_CONFINE_TABLES_H
@@ -542,18 +545,16 @@ static const int confine_group_server_files[] = {
     0 /* sentinel keeps the array non-empty on any port */
 };
 
-/* Terminal client only: child-transfer fork/exec and the child's own re-narrowing. */
 /*
  * Reaping and signalling a process this role created BEFORE it confined
- * itself.  The epoch-rekey client forks the remote command (ssh, or the lab's local
- * server) and then tears it down at shutdown: src/deaddrop_runtime.c:468
- * SIGTERM, :477 SIGKILL, :452/:478 waitpid.  Neither the terminal nor the
- * bulk client can create a new process once confined -- clone/fork/execve
- * live in the exec group -- so this only lets a role finish with children it
- * already had.  kill(2) is the one entry here that reaches beyond this
- * process tree (any process of the same uid); seccomp cannot bound its target
- * usefully.  What limits the damage is the process policy above: a confined
- * role cannot create a new process, so it can only signal what it already had.
+ * itself.  The public-bootstrap client forks the SSH carrier and tears it
+ * down at shutdown (SIGTERM, then SIGKILL, then waitpid, in
+ * src/deaddrop_runtime.c).  The bulk client cannot create a new process once
+ * confined; the terminal client can, through confine_group_exec below, and
+ * Landlock bounds what that process can be.  kill(2) is the one entry here
+ * that reaches beyond this process tree (any process of the same uid);
+ * seccomp cannot bound its target usefully, so a confined role can signal
+ * any process of its own user, not only the children it already had.
  */
 static const int confine_group_reap[] = {
 #ifdef __NR_wait4

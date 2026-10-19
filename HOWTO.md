@@ -83,7 +83,8 @@ traffic.
 `--remote` is the **path to the server's `unmoor` executable**, not a shell
 command. The example above assumes you extracted the bundle into the remote
 user's home directory. Give an absolute path if it lives elsewhere. Do not put
-shell syntax, quoting tricks or `~` into that value.
+shell syntax or quoting tricks into that value. A leading `~` is the one
+exception: it is passed through for the remote login shell to expand.
 
 Locally, `bin/client.sh` always runs the `unmoor` next to this checkout, never
 one that happens to be on your `PATH`. Add `--local PATH` when you deliberately
@@ -243,7 +244,8 @@ explicit flag, and neither happens behind your back.
 **Post-quantum.** `--pq=require` is the default for the bootstrap and for
 every rekey: fresh X25519 combined with ML-KEM-1024. A peer that cannot do
 that is identified and refused before an exchange is attempted. `--pq=prefer`
-permits exactly one visible fallback to such a peer. `--pq=off` asks for the
+is accepted but behaves exactly like `require` on this bootstrap, which has no
+legacy fallback: such a peer is refused either way. `--pq=off` asks for the
 legacy profile. Once both sides have selected the hybrid suite, a session
 cannot fall back mid-flight.
 
@@ -309,8 +311,10 @@ post-quantum bootstrap, a UDP session and a finite remote PTY over loopback
 using a local SSH fixture — it contacts no server and needs no SSH key. Its
 client side is a pipe, so it is a liveness test, not a loss or roaming matrix.
 
-On a Linux kernel without the confinement mechanisms, the smoke deliberately
-fails at the same refusal a real client would hit. Run
+The smoke passes no `--confine` option by itself, so on Linux its client runs
+under the default `require` policy. On a Linux kernel without the confinement
+mechanisms, the smoke therefore deliberately fails at the same refusal a real
+client would hit. Run
 `python3 tests/smoke.py --confine best-effort` only if you have decided to
 accept that reduction.
 
@@ -567,7 +571,7 @@ recommended `bin/client.sh` accepts the corresponding bootstrap-helper forms.
 
 | Option | Meaning and default |
 | --- | --- |
-| `--pq off|prefer|require` | Hybrid policy; default `require`. `prefer` permits one visible legacy fallback; `off` explicitly selects legacy. |
+| `--pq off|prefer|require` | Hybrid policy; default `require`. `prefer` is accepted but currently behaves like `require` on this bootstrap, which has no legacy fallback; `off` explicitly selects legacy. |
 | `--udp-host HOST` | UDP destination when it differs from the SSH destination's host part. |
 | `--remote-bind-host HOST` | Exact address family/address for the remote UDP listener. |
 | `--remote PATH` | Remote `unmoor` executable; default `unmoor`. It is an executable path, not a shell fragment. |
@@ -578,6 +582,7 @@ recommended `bin/client.sh` accepts the corresponding bootstrap-helper forms.
 | `--deaddrop-parent DIR` | Mode-0700 parent for one-shot public exchange records. |
 | `--bind-host HOST` | Direct deaddrop-listener bind address. The wrapper-facing spelling is `--remote-bind-host`. |
 | `--bootstrap-foreground` | Remote listener waits for its owned listener child; normally managed by the wrapper. |
+| `--log PATH` | Listener-side diagnostics file for `--deaddrop-bootstrap` and the one-shot bulk server; `UNMOOR_DEADDROP_LOG` is the environment form. The path must be a regular file owned by the user, or not exist yet. |
 | `--listener-monitor` | Experimental Linux x86-64/aarch64 classic-terminal isolation boundary. An explicit unsupported request fails; it never silently falls back. |
 
 For `bin/client.sh`, `--local PATH` deliberately selects another local binary;
@@ -642,4 +647,6 @@ wire budget (2400 B/s at the default MTU).
 | `UNMOOR_SYNC_PENDING_BYTES` | Receive reorder storage. Classic default/min/max: 4 MiB/64 KiB/1 GiB. Channelised per-stream default/max: 1 MiB/4 MiB. |
 | `UNMOOR_SYNC_LINGER_MS` | Final exact-stream acknowledgement wait; default 10000 ms. |
 | `UNMOOR_BOOTSTRAP_LOG` | Direct legacy `listen --bootstrap` stderr log after detach. |
-| `UNMOOR_BOOTSTRAP_TIMEOUT_SECS` | Direct legacy `listen --bootstrap` first-client accept window; default 60 seconds. It is not the public bootstrap `--timeout` or an established-session lifetime. |
+| `UNMOOR_BOOTSTRAP_TIMEOUT_SECS` | Direct legacy `listen --bootstrap` first-client accept window; default 60 seconds, and a value outside 1 to 86400 is ignored with a notice in the bootstrap log. It is not the public bootstrap `--timeout` or an established-session lifetime. |
+| `UNMOOR_DEADDROP_LOG` | Environment form of the listener-side `--log PATH` option for the public bootstrap and the one-shot bulk server; the option wins when both are given. |
+| `UNMOOR_SESSION` | Exported as `1` into the shell or command a listener runs for a session, so startup files can tell an Unmoor session from a plain login. The binary sets it and never reads it. |

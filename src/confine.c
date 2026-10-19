@@ -738,9 +738,11 @@ int confine_landlock_abi(void)
     return (int)abi;
 }
 
-/* Every filesystem right the running kernel knows about.  An access right
- * that is not in the handled mask is silently ALLOWED, so this must grow
- * with the ABI or the domain quietly stops covering new operations. */
+/* Every filesystem right this build knows how to name, capped by the ABI
+ * the running kernel reports.  An access right that is not in the handled
+ * mask is silently ALLOWED, so this list must grow with each new ABI level
+ * (it ends at the ABI 5 IOCTL_DEV right today) or the domain quietly stops
+ * covering new operations on newer kernels. */
 static uint64_t confine_handled_fs(int abi)
 {
     uint64_t handled = CONFINE_LL_EXECUTE | CONFINE_LL_WRITE_FILE |

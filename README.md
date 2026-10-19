@@ -217,7 +217,8 @@ Two defaults will stop you rather than quietly degrade, which is intentional:
 
 - **Post-quantum is required.** Bootstrap and every rekey combine fresh
   X25519 with ML-KEM-1024. A peer that cannot do that is refused by name.
-  `--pq=prefer` permits one visible fallback; `--pq=off` disables PQ. Both are
+  `--pq=prefer` is accepted but currently behaves like `require` on the SSH
+  bootstrap, which has no legacy fallback; `--pq=off` disables PQ. Both are
   explicit choices you have to type.
 - **Linux clients confine themselves.** Before accepting peer-controlled
   session work, a client applies `no_new_privs`, a Landlock path allow-list and

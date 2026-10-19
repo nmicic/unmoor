@@ -78,16 +78,28 @@ already buys.
   session key and decrypt the whole session retroactively. Relatedly,
   `UNMOOR_KEY` carries a symmetric key through the environment, and
   `listen --bootstrap` prints a freshly generated one on stdout for a caller
-  to relay; both are documented, and neither is the recommended path. The PSK
-  modes exist for testing. Use `bin/client.sh`.
-- **A targeted flood can fill the bounded pre-authentication table.** The
-  table holds 64 source addresses for 2 seconds after an AEAD failure; while
-  full, it also drops datagrams from an established session. An attacker must
-  first observe the live UDP flow to learn its ephemeral destination port and
-  clear four-byte pair identifier, then keep traffic arriving from 64 distinct
-  deliverable addresses. Stop the traffic and the table drains in 2 seconds;
+  to relay; both are documented, and neither is the recommended path. Without
+  rekey that path also has a hard stop: its 32-bit sequence space is never
+  renewed, and a session that nearly exhausts it refuses to send rather than
+  reuse a nonce (`sequence space exhausted` in `src/session.c`). The PSK modes
+  exist for testing. Use `bin/client.sh`.
+- **A targeted flood can silence a peer, and one source address is enough.**
+  Every datagram that fails AEAD is charged to its source address
+  (`src/preauth_budget.h`): eight failures within two seconds put that
+  address into a two-second penalty during which its datagrams are dropped
+  before any further AEAD work, genuine ones included. The budget is keyed on
+  the address alone, never the port, so traffic spoofed to carry the live
+  peer's address penalises the live peer. An attacker who can observe the
+  flow to learn its destination port and clear four-byte pair identifier
+  therefore needs no deliverable addresses of their own: roughly four bad
+  datagrams per second with the peer's address as the source keep that peer
+  silent for as long as they continue. The table has 64 address slots, and
+  while every slot is busy, datagrams from addresses it does not hold, an
+  established session's included, are dropped too. The client runs the same
+  budget. Stop the traffic and the penalty drains within about four seconds;
   restart through SSH and the new session has a fresh port and pair identity.
-  This can interrupt availability but cannot read, forge or weaken traffic.
+  The `SIGUSR1` snapshot reports the budget's counters. This can interrupt
+  availability but cannot read, forge or weaken traffic.
 - **The return path follows whichever authenticated datagram arrives first.**
   A listener adopts a new return address when an authenticated datagram
   advances the replay high-water mark (`src/session.c`, the `peer_confirm`
@@ -111,14 +123,33 @@ already buys.
   while it parses that record. The peer in question has already completed an
   authenticated bootstrap, so this narrows what an authorised peer can reach
   rather than keeping an unauthorised one out.
-- **The seccomp allow-lists do not filter syscall arguments.** `ioctl` is in
-  the base group that every confined role gets (`src/confine_tables.h`), with
-  no argument filtering anywhere, so a confined process may issue any request
-  code on any descriptor it already holds. The allow-lists are deliberately
-  generous about syscalls that cannot widen authority and strict about the
-  ones that can — `execve`, `clone`, `ptrace`, `mount`, `chroot`, `set*uid`,
-  `bpf`, `kexec`, module loading, `keyctl` and `process_vm_*` appear in no
-  group — but read "confined" as "narrowed", not "sandboxed".
+- **The seccomp allow-lists filter almost no syscall arguments, and the
+  confined client keeps more than "sandboxed" suggests.** Argument filters
+  exist for exactly two calls: `prctl` is admitted for three fixed requests,
+  and the one-shot bulk server's `fcntl` for a fixed set of commands
+  (`src/confine.c`). Everything else on a role's list may be issued with any
+  argument on any descriptor the process already holds: `ioctl` with any
+  request code (on kernels that still permit `TIOCSTI`, that means typing
+  into a controlling terminal), and `kill`, `tgkill` and `prlimit64` against
+  any process of the same user, not only children. The terminal client keeps
+  `clone` and `execve` for its child transfers; what they can start is
+  bounded by Landlock execute rights on the binary's own image and the loader
+  paths plus `no_new_privs`, not by seccomp. Several filesystem operations
+  are outside Landlock on the ABI levels a client accepts: `chmod`, `umask`
+  and `utimensat` always, `truncate` below ABI 3 and TCP sockets below ABI 4,
+  while UDP and Unix sockets are never restricted. The allow-lists are
+  deliberately generous about syscalls that cannot widen authority and strict
+  about the ones that can — `ptrace`, `mount`, `chroot`, `set*uid`, `bpf`,
+  `kexec`, module loading, `keyctl` and `process_vm_*` appear in no group —
+  but read "confined" as "narrowed", not "sandboxed".
+- **Another user on the same host can deny a start, not join a session.** The
+  UDP listener binds its port exclusively, so a second process cannot share
+  the socket and take datagrams; a port that is already taken is a loud
+  failure. The `--listener-monitor` rendezvous between the monitor and its
+  listener child uses a predictable abstract Unix socket name that any local
+  user can bind first; the start then fails with a clear error and does not
+  retry. A Unix-socket transport accepts connections only from the same user,
+  and the listener's `--log` file must be a regular file that user owns.
 - **Backlog is bounded per sender, not globally.** Classic terminal state sync
   holds up to 256 MiB of transmit history and 4 MiB of receive-pending data per
   endpoint by default. Channelised exact streams default to 16 MiB/1 MiB per
@@ -129,9 +160,27 @@ already buys.
   is an observation, not proof that the peer is dead. A listener can remain
   alive until an operator or normal session teardown closes it.
 - **`--pq=prefer` and `--pq=off` are real reductions.** Both exist, both must
-  be typed explicitly, and both are visible in the logs. `--confine=off` and
-  `--confine=best-effort` are the same kind of deliberate reduction on the
-  client side.
+  be typed explicitly, and both are visible in the logs. On the recommended
+  SSH bootstrap, `prefer` currently behaves exactly like `require`: the
+  one-shot exchange has no legacy fallback, so a peer without the hybrid
+  suite is refused either way, and only `off` selects the legacy profile.
+  `--confine=off` and `--confine=best-effort` are the same kind of deliberate
+  reduction on the client side.
+- **Terminal output is not sanitised, and neither is the SSH carrier's
+  stderr.** Bytes the far end writes to the terminal reach your terminal
+  emulator as they are; the client filters only its own escape key on the
+  way in (`src/client_escape.c`). A hostile or compromised server can drive
+  any sequence your emulator honours, exactly as it can over plain `ssh`, so
+  the emulator's own protections are part of the trust base. Separately, the
+  `ssh` child inherits the client's stderr during the bootstrap and, under
+  `--remote-foreground`, for the whole session, so that OpenSSH banners and
+  diagnostics stay visible. That stream is unfiltered, and it is shared with
+  `--log-format json` records; a consumer of those records must not assume
+  it is the only writer of that descriptor.
+- **Key memory is pinned only where the platform allows it.** The session
+  asks the kernel to keep its key material out of swap (`crypto_mlock` in
+  `src/crypto.c`); when that fails, for example under a low memory-lock
+  limit, a warning is printed and the session continues.
 - **No resume, no recursion, no metadata promise** for file transfer. A
   destination appears only after the whole transfer verifies, but an
   interrupted transfer starts again from the beginning.
@@ -139,8 +188,10 @@ already buys.
   are fast checks that prove a build works and a real post-quantum session
   runs. The full regression suite and the two-machine impairment gate live in
   the development tree; `SOURCE.md` reports that gate run against this source.
-  One specific gap: `tests/smoke.py` passes `--confine best-effort` and never
-  `--confine=require`, which is the Linux default.
+  The smoke passes no `--confine` option unless asked, so on Linux it runs
+  under the default `require` policy; `--confine best-effort` is an explicit
+  opt-in for older kernels. It does not exercise attached transfers, bulk
+  transfer or `--listener-monitor`.
 
 ## What is out of scope
 

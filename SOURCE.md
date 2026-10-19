@@ -103,7 +103,9 @@ agree on it; both ends of any pair built from this tree do.
 `src/main.c`.** `--d42-child-result-fd` and `--d42-transfer-id` are now
 `--child-result-fd` and `--child-transfer-id`. They are passed by the parent
 process to a child it just spawned from the same binary, so the emitter and
-the parser move together; they are not part of the documented CLI.
+the parser move together; they are not part of the documented CLI. Several
+other flags are internal in the same way: the binary accepts them only from
+its own wrapper or parent process, and they are not a user interface either.
 
 **Four dead conditional hooks removed from `src/main.c`.** Each was an
 `#if defined(UNMOOR_BULK_REKEY_RUNTIME_TEST)` block calling a function that
