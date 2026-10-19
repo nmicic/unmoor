@@ -6419,6 +6419,27 @@ int session_diagnostic_snapshot(session_t *s, int fd,
         s->epoch_rekey_enabled ? s->epoch : 0U, auth_age_ms,
         s->tx_seq, s->rx_hwm, s->replay_drop_count, s->selected_caps);
 
+    /* The pre-authentication budget is the one place an unauthenticated
+     * sender leaves a trace; a flood shows up here before anything else. */
+    session_diagnostic_line(
+        &writer,
+        "unmoor: diagnostic id=%" PRIu64 " preauth aead-attempts=%" PRIu64
+        " aead-failures=%" PRIu64 " budget-drops=%" PRIu64
+        " table-full-drops=%" PRIu64,
+        snapshot_id,
+        s->preauth_budget.counters.aead_attempt,
+        s->preauth_budget.counters.aead_failure,
+        s->preauth_budget.counters.budget_drop,
+        s->preauth_budget.counters.table_full_drop);
+    session_diagnostic_line(
+        &writer,
+        "unmoor: diagnostic id=%" PRIu64 " preauth no-key-drops=%" PRIu64
+        " unknown-pair-drops=%" PRIu64 " malformed-drops=%" PRIu64,
+        snapshot_id,
+        s->preauth_budget.counters.no_key_drop,
+        s->preauth_budget.counters.unknown_pair_drop,
+        s->preauth_budget.counters.malformed_preauth_drop);
+
     if (have_transport_stats) {
         session_diagnostic_line(
             &writer,

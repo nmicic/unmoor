@@ -8,7 +8,9 @@
  * key authenticates anything built with it, and that the AEAD wrappers
  * refuse such a key outright. They also pin that the pair id, not the frame
  * type, selects the key: a pending-pair control frame is verified under the
- * pending key alone even while the hello key is live.
+ * pending key alone even while the hello key is live. Under a live key they
+ * also pin the replay window, which is all that stops an authenticated
+ * datagram from being accepted twice.
  *
  * Copyright (c) 2026 Nenad Micic
  * SPDX-License-Identifier: Apache-2.0
@@ -485,6 +487,81 @@ static void test_live_session_key_still_authenticates(void)
     session_destroy(session);
 }
 
+static int feed_live(session_t *session, const uint8_t pair[4],
+                     const uint8_t key[32], uint32_t seq,
+                     const multipath_token_t *source, int64_t now_ms)
+{
+    uint8_t frame[FRAME_MAX_LEN];
+    size_t frame_length = 0U;
+
+    if (build_live_frame(pair, key, 0x00U, seq, CTRL_KEEPALIVE_ACK,
+                         frame, &frame_length) != 0)
+        return -1;
+    session_process_datagram_from_at(session, frame, frame_length, source,
+                                     now_ms);
+    return 0;
+}
+
+/* Feed authenticated frames under the live session key and pin the replay
+ * window's four answers: a new sequence is accepted and advances the
+ * high-water mark; an exact duplicate authenticates, is dropped and counted,
+ * and refreshes no liveness; an older sequence inside the window is accepted
+ * exactly once; a sequence that fell below the window is dropped for good. */
+static void test_replay_window_drops_duplicates_and_stale_sequences(void)
+{
+    const uint8_t pair[4] = { 0x70U, 0x71U, 0x72U, 0x73U };
+    uint8_t key[32];
+    capture_transport_t capture;
+    session_t *session = fixture_create(&capture, pair, 1,
+                                        SESSION_ESTABLISHED);
+    multipath_token_t source = token4(9005U, 6U);
+    int ok = session != NULL;
+
+    fill_key(key, 0xf7U);
+    if (ok) {
+        memcpy(session->session_key, key, 32U);
+        session->have_session_key = 1;
+        session->services_started = 1;
+        session->have_hello_key = 0;
+    }
+
+    ok = ok && feed_live(session, pair, key, 10U, &source, 5000) == 0;
+    CHECK("KG-10a a fresh sequence is accepted and sets the high-water mark",
+          ok && session->replay.hwm == 10U &&
+          session->replay_drop_count == 0U &&
+          session->last_authenticated_ms == 5000);
+
+    ok = ok && feed_live(session, pair, key, 10U, &source, 5001) == 0;
+    CHECK("KG-10b an exact duplicate is dropped after it authenticates",
+          ok && session->preauth_budget.counters.aead_attempt == 2U &&
+          session->preauth_budget.counters.aead_failure == 0U &&
+          session->replay_drop_count == 1U &&
+          session->last_authenticated_ms == 5000);
+
+    ok = ok && feed_live(session, pair, key, 12U, &source, 5002) == 0;
+    ok = ok && feed_live(session, pair, key, 11U, &source, 5003) == 0;
+    CHECK("KG-10c an older sequence inside the window is accepted once",
+          ok && session->replay.hwm == 12U &&
+          session->replay_drop_count == 1U &&
+          session->last_authenticated_ms == 5003);
+
+    ok = ok && feed_live(session, pair, key, 11U, &source, 5004) == 0;
+    CHECK("KG-10d the same older sequence is dropped the second time",
+          ok && session->replay_drop_count == 2U &&
+          session->last_authenticated_ms == 5003);
+
+    ok = ok && feed_live(session, pair, key, 12U + REPLAY_WINDOW, &source,
+                         5005) == 0;
+    ok = ok && feed_live(session, pair, key, 11U, &source, 5006) == 0;
+    ok = ok && feed_live(session, pair, key, 10U, &source, 5007) == 0;
+    CHECK("KG-10e sequences below the window are dropped for good",
+          ok && session->replay.hwm == 12U + REPLAY_WINDOW &&
+          session->replay_drop_count == 4U &&
+          session->last_authenticated_ms == 5005 &&
+          session->state == SESSION_ESTABLISHED && !session->run_failed);
+    session_destroy(session);
+}
+
 static void test_wrappers_refuse_zero_key_and_null_arguments(void)
 {
     uint8_t live[32];
@@ -568,6 +645,7 @@ int main(void)
     test_idle_listener_has_no_session_key();
     test_connecting_stash_is_kept();
     test_live_session_key_still_authenticates();
+    test_replay_window_drops_duplicates_and_stale_sequences();
     test_wrappers_refuse_zero_key_and_null_arguments();
     test_wipe_clears_liveness_flags();
     printf("session_key_gate_test: %d/%d passed\n", total - failed, total);
