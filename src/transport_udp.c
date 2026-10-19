@@ -284,9 +284,10 @@ static int listener_socket_open(int family)
     fd = socket(family, SOCK_DGRAM, 0);
     if (fd < 0)
         return -1;
+    /* No SO_REUSEADDR: UDP has no TIME_WAIT to work around, and the option
+     * would let another local process co-bind the listener port and take
+     * every inbound datagram. A busy port must fail with EADDRINUSE. */
     if (set_nonblocking_cloexec(fd) != 0 ||
-        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR,
-                   &one, sizeof(one)) != 0 ||
         (family == AF_INET6 &&
          setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY,
                     &one, sizeof(one)) != 0)) {
@@ -816,11 +817,10 @@ static int udp_open(const transport_config_t *cfg, transport_t **out)
     if (cfg->listen && cfg->udp_host) {
         int one = 1;
 
-        if (setsockopt(t->fd[0], SOL_SOCKET, SO_REUSEADDR,
-                       &one, sizeof(one)) != 0 ||
-            (selected->ai_family == AF_INET6 &&
-             setsockopt(t->fd[0], IPPROTO_IPV6, IPV6_V6ONLY,
-                        &one, sizeof(one)) != 0)) {
+        /* Exclusive bind only; see listener_socket_open. */
+        if (selected->ai_family == AF_INET6 &&
+            setsockopt(t->fd[0], IPPROTO_IPV6, IPV6_V6ONLY,
+                       &one, sizeof(one)) != 0) {
             fprintf(stderr,
                     "transport_udp: cannot configure native listener socket: %s\n",
                     strerror(errno));

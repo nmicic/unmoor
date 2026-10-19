@@ -270,21 +270,13 @@ static int emit_local_message(role_builder_t *builder, int number,
 
 static int emit_udp_socket_options(role_builder_t *builder)
 {
-    size_t start, socket_level, ipv6_level, distance;
+    size_t start, ipv6_level, distance;
+    /* The only socket option the UDP legs set is IPV6_V6ONLY; the listener
+     * binds exclusively, so no SOL_SOCKET option is admitted. */
     if (begin_syscall(builder, SYS_setsockopt, &start) != 0 ||
         require_high_zero(builder, 1U) != 0 ||
         emit_stmt(builder, BPF_LD | BPF_W | BPF_ABS, arg_low(1U)) != 0)
         return -1;
-
-    socket_level = builder->count;
-    if (emit_jump(builder, BPF_JMP | BPF_JEQ | BPF_K,
-                  (uint32_t)SOL_SOCKET, 0, 0) != 0 ||
-        require_exact(builder, 2U, (uint32_t)SO_REUSEADDR) != 0 ||
-        emit_allow(builder) != 0)
-        return -1;
-    distance = builder->count - socket_level - 1U;
-    if (distance > UINT8_MAX) return fail_with(E2BIG);
-    builder->instructions[socket_level].jf = (uint8_t)distance;
 
     ipv6_level = builder->count;
     if (emit_jump(builder, BPF_JMP | BPF_JEQ | BPF_K,
