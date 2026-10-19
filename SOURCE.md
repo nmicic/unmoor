@@ -215,7 +215,7 @@ Checked rather than assumed: apart from that section's 21 lines, the only
 lines that appear verbatim in both are the copyright comment, three Markdown
 headings and the code-fence markers.
 
-The `Makefile` (120 lines, against 1377 in the development tree), `.gitignore`,
+The `Makefile` (148 lines, against 1377 in the development tree), `.gitignore`,
 the CI workflow, the five `bin/` wrappers, `tests/hygiene.sh`, `tests/smoke.py`
 and its two fixtures were likewise written for this tree. `make bundle` and
 the CI job that unpacks its output into an empty directory exist so that a

@@ -1,0 +1,11 @@
+# Copyright (c) 2026 Nenad Micic
+# SPDX-License-Identifier: Apache-2.0
+#
+# The only third-party code this repository runs in CI is the pinned
+# checkout action; keep its pin current.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

@@ -9,6 +9,7 @@ CPPFLAGS ?=
 LDFLAGS ?=
 PYTHON ?= python3
 MUSL_CC ?= musl-gcc
+CLANG ?= clang
 
 PLATFORM := $(shell uname -s)
 ARCH := $(shell uname -m)
@@ -19,9 +20,11 @@ DEFS := -DMLK_CONFIG_FILE=\"unmoor_mlkem_config.h\"
 # Keep upstream mandatory protection flags even with command-line CFLAGS.
 probe-c-flag = $(strip $(shell printf '%s\n' 'int main(void){return 0;}' | \
     $(1) $(2) -x c -c -o /dev/null - >/dev/null 2>&1 && printf '%s' '$(2)'))
-override CFLAGS += -Wsign-compare -Wformat=2 -fstack-protector-strong
+override CFLAGS += -Wsign-compare -Wformat=2 -fstack-protector-strong \
+    $(call probe-c-flag,$(CC),-ftrivial-auto-var-init=zero)
 ifeq ($(PLATFORM),Linux)
-  DEFS += -D_FORTIFY_SOURCE=2
+  # Level 3 where the toolchain has it; older glibc headers fall back to 2.
+  DEFS += -D_FORTIFY_SOURCE=3
   override CFLAGS += -fPIE $(call probe-c-flag,$(CC),-fstack-clash-protection)
   override LDFLAGS += -pie -Wl,-z,relro,-z,now -Wl,-z,noexecstack
   override LDLIBS += -lutil
@@ -60,7 +63,7 @@ ALL_OBJS := $(sort $(OBJS) $(FRAME_OBJS) $(PQ_OBJS) $(KEY_GATE_OBJS))
 TESTS := $(BUILD)/frame_test $(BUILD)/pq_crypto_test \
     $(BUILD)/session_key_gate_test
 
-.PHONY: all check test smoke hygiene shell-syntax clean bundle unmoor-static help
+.PHONY: all check test smoke hygiene shell-syntax analyze clean bundle unmoor-static help
 all: unmoor
 
 unmoor: $(OBJS)
@@ -114,6 +117,18 @@ unmoor-static:
 	    -Wl,-z,relro,-z,now -Wl,-z,noexecstack -o $@ $(SRCS)
 	sh tests/hygiene.sh ./unmoor-static
 
+# Static analysis of the product sources with the clang analyzer; the vendored
+# libraries are upstream code and are not analysed here. Any report fails the
+# target. The analyzer writes no files.
+ANALYZE_SRCS := $(sort $(wildcard src/*.c))
+analyze:
+	@command -v $(CLANG) >/dev/null 2>&1 || { printf '%s\n' 'analyze: $(CLANG) not found' >&2; exit 1; }
+	@status=0; for src in $(ANALYZE_SRCS); do \
+	    out=$$($(CLANG) --analyze -Xanalyzer -analyzer-output=text -O2 -std=c11 \
+	        $(CPPFLAGS) $(DEFS) $(INC) $$src 2>&1) || status=1; \
+	    if [ -n "$$out" ]; then printf '%s\n' "$$out"; status=1; fi; \
+	done; test $$status -eq 0 && printf '%s\n' 'analyze: PASS (clang static analyzer, $(words $(ANALYZE_SRCS)) files)'
+
 bundle:
 	sh bin/source-bundle.sh
 
@@ -125,6 +140,7 @@ help:
 	@printf '%s\n' 'make                 native production binary' \
 	    'make check           focused C, shell and production-symbol checks' \
 	    'make smoke           clean local PQ/UDP/PTY smoke (Python 3)' \
+	    'make analyze         clang static analyzer over src/ (needs clang)' \
 	    'make unmoor-static   optional native Linux musl static-PIE binary' \
 	    'make bundle          source-only archive of clean committed HEAD (Git)' \
 	    'make clean           remove named build products for this platform'

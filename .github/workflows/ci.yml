@@ -4,7 +4,9 @@
 # Minimal continuous integration: build the tree from scratch on Linux and
 # macOS, run the unit tests and hygiene checks, then run the loopback smoke
 # test, which starts a real post-quantum bootstrap and a real PTY over UDP on
-# the runner itself. Nothing here contacts a network host.
+# the runner itself. The clang job also runs the static analyzer, and a
+# separate job runs the unit tests under AddressSanitizer and
+# UndefinedBehaviorSanitizer. Nothing here contacts a network host.
 
 name: build and test
 
@@ -49,6 +51,10 @@ jobs:
       - name: unit tests, symbol hygiene, shell syntax
         run: make check
 
+      - name: static analysis
+        if: matrix.name == 'linux-clang'
+        run: make analyze
+
       - name: loopback smoke
         run: make smoke
 
@@ -62,3 +68,24 @@ jobs:
           make -j2
           make check
           make smoke
+
+  sanitizers:
+    name: linux-clang-sanitizers
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CC: clang
+      ASAN_OPTIONS: detect_leaks=1
+      UBSAN_OPTIONS: print_stacktrace=1
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: compiler version
+        run: clang --version
+
+      - name: unit tests under AddressSanitizer and UndefinedBehaviorSanitizer
+        run: >
+          make -j2 test
+          CFLAGS='-O1 -g -std=c11 -Wall -Wextra -fsanitize=address,undefined
+          -fno-sanitize-recover=all -fno-omit-frame-pointer'
+          LDFLAGS='-fsanitize=address,undefined'
