@@ -57,8 +57,9 @@ usage: unmoor-deaddrop-ssh [--local PATH] [--remote CMD] [--udp-host HOST]
 
 The last argument is the SSH destination.  The UDP host defaults to its host
 part; use --udp-host when an SSH alias does not resolve on the UDP path.
---pq defaults to require; use prefer explicitly for a visible v1-only peer
-fallback, or off explicitly for the legacy profile.
+--pq defaults to require.  prefer currently behaves exactly like require on
+this bootstrap, which has no legacy fallback; only off selects the legacy
+profile, and it must be typed explicitly.
 --attach-socket is local-only, requires --channelised, and is never sent over
 SSH or included in the remote listener command.  Port layout/mask likewise
 configure only child transfers launched through that local socket.

@@ -124,10 +124,12 @@ already buys.
   authenticated bootstrap, so this narrows what an authorised peer can reach
   rather than keeping an unauthorised one out.
 - **The seccomp allow-lists filter almost no syscall arguments, and the
-  confined client keeps more than "sandboxed" suggests.** Argument filters
-  exist for exactly two calls: `prctl` is admitted for three fixed requests,
-  and the one-shot bulk server's `fcntl` for a fixed set of commands
-  (`src/confine.c`). Everything else on a role's list may be issued with any
+  confined client keeps more than "sandboxed" suggests.** In the client and
+  server filters (`src/confine.c`) argument filters exist for exactly two
+  calls: `prctl` is admitted for three fixed requests, and the one-shot bulk
+  server's `fcntl` for a fixed set of commands; the listener monitor's own
+  filter (`src/monitor_roles.c`) also pins the arguments of `setsockopt`,
+  `fcntl` and `kill`. Everything else on a role's list may be issued with any
   argument on any descriptor the process already holds: `ioctl` with any
   request code (on kernels that still permit `TIOCSTI`, that means typing
   into a controlling terminal), and `kill`, `tgkill` and `prlimit64` against
