@@ -91,13 +91,20 @@ already buys.
   the address alone, never the port, so traffic spoofed to carry the live
   peer's address penalises the live peer. An attacker who can observe the
   flow to learn its destination port and clear four-byte pair identifier
-  therefore needs no deliverable addresses of their own: roughly four bad
-  datagrams per second with the peer's address as the source keep that peer
-  silent for as long as they continue. The table has 64 address slots, and
-  while every slot is busy, datagrams from addresses it does not hold, an
-  established session's included, are dropped too. The client runs the same
-  budget. Stop the traffic and the penalty drains within about four seconds;
-  restart through SSH and the new session has a fresh port and pair identity.
+  therefore needs no deliverable addresses of their own: eight bad datagrams
+  with the peer's address as the source, sent as a burst each time the
+  previous penalty expires, keep that peer silent for as long as the bursts
+  continue, four datagrams per second on average. Spread evenly instead, the
+  same four per second silence the peer for roughly half of each cycle:
+  datagrams that arrive during a penalty are dropped without extending it,
+  and the next eight failures take almost two seconds to accumulate. The
+  table has 64 address slots, and while every slot is busy, datagrams from
+  addresses it does not hold, an established session's included, are dropped
+  too. The client runs the same budget. Stop the traffic and the address is
+  clear within two seconds of its last bad datagram: a penalty lasts exactly
+  two seconds from the eighth failure, and a partial count expires two
+  seconds after the first. Restart through SSH and the new session has a
+  fresh port and pair identity.
   The `SIGUSR1` snapshot reports the budget's counters. This can interrupt
   availability but cannot read, forge or weaken traffic.
 - **The return path follows whichever authenticated datagram arrives first.**
@@ -139,7 +146,12 @@ already buys.
   paths plus `no_new_privs`, not by seccomp. Several filesystem operations
   are outside Landlock on the ABI levels a client accepts: `chmod`, `umask`
   and `utimensat` always, `truncate` below ABI 3 and TCP sockets below ABI 4,
-  while UDP and Unix sockets are never restricted. The allow-lists are
+  while UDP traffic and connections to existing Unix sockets are never
+  restricted. Creating a pathname Unix socket is a filesystem right that the
+  rulesets handle at every ABI, so it is refused outside the few directories
+  a role is granted, such as a client's data roots and its attach socket
+  directory; abstract-namespace sockets have no path for Landlock to see.
+  The allow-lists are
   deliberately generous about syscalls that cannot widen authority and strict
   about the ones that can — `ptrace`, `mount`, `chroot`, `set*uid`, `bpf`,
   `kexec`, module loading, `keyctl` and `process_vm_*` appear in no group —
