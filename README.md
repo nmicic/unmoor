@@ -241,7 +241,7 @@ src/vendor/       Monocypher 4.0.3 and mlkem-native, their upstream sources
                   one ML-KEM build-config header this project adds
 bin/              thin wrappers: build, the `unmoor.sh` entry point, client,
                   listener, source bundle
-tools/            the SSH bootstrap helper and two standalone test programs
+tools/            the SSH bootstrap helper and three standalone test programs
 tests/            hygiene check and the end-to-end loopback smoke
 ```
 

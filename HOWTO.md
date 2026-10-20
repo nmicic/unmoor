@@ -305,11 +305,12 @@ property; the other two do not have it.
 ## 9. Checks, diagnostics and limits
 
 `make check` runs the frame, reassembly, negotiation and ML-KEM unit tests,
-a shell-syntax pass, and a hygiene check that asserts the production binary
-exports no test-only symbols. `make smoke` additionally runs a real
-post-quantum bootstrap, a UDP session and a finite remote PTY over loopback
-using a local SSH fixture — it contacts no server and needs no SSH key. Its
-client side is a pipe, so it is a liveness test, not a loss or roaming matrix.
+the session-key liveness and replay-window checks, a shell-syntax pass, and a
+hygiene check that asserts the production binary exports no test-only symbols.
+`make smoke` additionally runs a real post-quantum bootstrap, a UDP session
+and a finite remote PTY over loopback using a local SSH fixture — it contacts
+no server and needs no SSH key. Its client side is a pipe, so it is a liveness
+test, not a loss or roaming matrix.
 
 The smoke passes no `--confine` option by itself, so on Linux its client runs
 under the default `require` policy. On a Linux kernel without the confinement

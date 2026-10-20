@@ -28,11 +28,11 @@ datagram was raised from the small LoRa-oriented URTB inheritance to a
 | --- | --- |
 | `src/*.c`, `src/*.h` | 132 files — the whole implementation |
 | `src/vendor/` | 39 files — Monocypher 4.0.3 and mlkem-native, upstream sources unmodified, plus four files this project adds beside them: a build-config header, two vendoring notes and a license copy |
-| `tools/` | the SSH bootstrap helper, and two standalone test programs |
+| `tools/` | the SSH bootstrap helper, and three standalone test programs |
 | `bin/` | five short wrappers around `make` and the binary |
 | `tests/` | the hygiene check, the loopback smoke, and its fixtures |
 | `Makefile` | the whole build |
-| `.github/` | one workflow: the same build and checks on Linux and macOS |
+| `.github/` | one workflow (build, checks, static analysis and smoke on Linux and macOS, plus a sanitizer job) and a Dependabot configuration for its one pinned action |
 
 Every file outside `src/vendor/` carries `Copyright (c) 2026 Nenad Micic` and
 `SPDX-License-Identifier: Apache-2.0` — the two exceptions being `LICENSE`
@@ -224,11 +224,13 @@ downloads it.
 
 ## Verification run
 
-Everything below was run against the source in this repository, at the commit
-being published — not against the development tree, and not against an earlier
-draft of this one. Where a run used two machines, both built from the same
-`make bundle` archive of this tree, and the run is reported with the digest
-they agreed on.
+Everything below was run against the source in this repository as it stood at
+the publication of 2026-09-15 — not against the development tree, and not
+against an earlier draft. The hardening commits made since then have been built
+and checked on macOS and on Linux, but had not been through the two-machine
+gate when this paragraph was written; this section is refreshed when they have.
+Where a run used two machines, both built from the same `make bundle` archive
+of this tree, and the run is reported with the digest they agreed on.
 
 ### macOS — Darwin arm64, Apple clang 21.0.0 — 2026-09-15
 
@@ -414,13 +416,16 @@ is the source both guests built and the binary they ran. The single-host
 checks (`make check`, `make smoke`) reproduce from this tree directly.
 
 Not exercised by these runs: static-musl linking, and IPv6 roaming across real
-interface changes. `tests/smoke.py` passes `--confine best-effort` and never
-`--confine=require`, which is the Linux default. There has been no external
+interface changes. `make smoke` passes no `--confine` option, so on Linux its
+client runs under the default `require` policy; `tests/smoke.py` accepts
+`--confine best-effort` as its only override. There has been no external
 security audit.
 
 `.github/workflows/ci.yml` is configured to run the build, `make check` and
-`make smoke` on Linux with GCC and with Clang and on macOS with Clang, and then
-repeat all three from the `make bundle` archive unpacked into an empty
-directory. Everything reported above was run by hand.
+`make smoke` on Linux with GCC and with Clang and on macOS with Clang, to run
+`make analyze` on the Linux Clang job, to repeat the build, checks and smoke
+from the `make bundle` archive unpacked into an empty directory, and to run
+the unit tests under AddressSanitizer and UndefinedBehaviorSanitizer in a
+separate job. Everything reported above was run by hand.
 
 Copyright (c) 2026 Nenad Micic.
