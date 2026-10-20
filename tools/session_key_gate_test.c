@@ -506,7 +506,8 @@ static int feed_live(session_t *session, const uint8_t pair[4],
  * window's four answers: a new sequence is accepted and advances the
  * high-water mark; an exact duplicate authenticates, is dropped and counted,
  * and refreshes no liveness; an older sequence inside the window is accepted
- * exactly once; a sequence that fell below the window is dropped for good. */
+ * exactly once; a sequence that fell below the window is dropped for good.
+ * The return path is confirmed only by a datagram that advances the mark. */
 static void test_replay_window_drops_duplicates_and_stale_sequences(void)
 {
     const uint8_t pair[4] = { 0x70U, 0x71U, 0x72U, 0x73U };
@@ -526,38 +527,43 @@ static void test_replay_window_drops_duplicates_and_stale_sequences(void)
     }
 
     ok = ok && feed_live(session, pair, key, 10U, &source, 5000) == 0;
-    CHECK("KG-10a a fresh sequence is accepted and sets the high-water mark",
+    CHECK("KG-12a a fresh sequence is accepted and sets the high-water mark",
           ok && session->replay.hwm == 10U &&
           session->replay_drop_count == 0U &&
-          session->last_authenticated_ms == 5000);
+          session->last_authenticated_ms == 5000 &&
+          capture.peer_confirms == 1U);
 
     ok = ok && feed_live(session, pair, key, 10U, &source, 5001) == 0;
-    CHECK("KG-10b an exact duplicate is dropped after it authenticates",
+    CHECK("KG-12b an exact duplicate is dropped after it authenticates",
           ok && session->preauth_budget.counters.aead_attempt == 2U &&
           session->preauth_budget.counters.aead_failure == 0U &&
           session->replay_drop_count == 1U &&
-          session->last_authenticated_ms == 5000);
+          session->last_authenticated_ms == 5000 &&
+          capture.peer_confirms == 1U);
 
     ok = ok && feed_live(session, pair, key, 12U, &source, 5002) == 0;
     ok = ok && feed_live(session, pair, key, 11U, &source, 5003) == 0;
-    CHECK("KG-10c an older sequence inside the window is accepted once",
+    CHECK("KG-12c an older sequence inside the window is accepted once",
           ok && session->replay.hwm == 12U &&
           session->replay_drop_count == 1U &&
-          session->last_authenticated_ms == 5003);
+          session->last_authenticated_ms == 5003 &&
+          capture.peer_confirms == 2U);
 
     ok = ok && feed_live(session, pair, key, 11U, &source, 5004) == 0;
-    CHECK("KG-10d the same older sequence is dropped the second time",
+    CHECK("KG-12d the same older sequence is dropped the second time",
           ok && session->replay_drop_count == 2U &&
-          session->last_authenticated_ms == 5003);
+          session->last_authenticated_ms == 5003 &&
+          capture.peer_confirms == 2U);
 
     ok = ok && feed_live(session, pair, key, 12U + REPLAY_WINDOW, &source,
                          5005) == 0;
     ok = ok && feed_live(session, pair, key, 11U, &source, 5006) == 0;
     ok = ok && feed_live(session, pair, key, 10U, &source, 5007) == 0;
-    CHECK("KG-10e sequences below the window are dropped for good",
+    CHECK("KG-12e sequences below the window are dropped for good",
           ok && session->replay.hwm == 12U + REPLAY_WINDOW &&
           session->replay_drop_count == 4U &&
           session->last_authenticated_ms == 5005 &&
+          capture.peer_confirms == 3U &&
           session->state == SESSION_ESTABLISHED && !session->run_failed);
     session_destroy(session);
 }
