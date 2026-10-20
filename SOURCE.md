@@ -231,21 +231,20 @@ downloads it.
 
 ## Verification run
 
-The single-host runs below were made on 2026-10-20 against the source in this
-repository as it is being published, with every hardening commit in it. The
-two-machine runs are from the publication of 2026-09-15 and were made against
-the source as it stood then — not against the development tree, and not
-against an earlier draft. They have not been repeated with the current source
-as the product under test, and they keep their date. What has been through the
-two-machine gate since is the development tree carrying the same hardening
-changes: on 2026-10-20 its routed two-guest matrix and its loss matrix passed
-on the commit that ports them. That is evidence about the development tree and
-is reported here as that, not as a run of this repository's source; the dated
-sections are refreshed when they have been re-run. The two-machine runs of
-2026-09-15 were made on both machines from the same `make bundle` archive of
-this repository's source as it stood then, and each is reported with the
-digest the two machines agreed on. The 2026-10-20 run of the development tree
-is not a run of such an archive and reports no digest here.
+Every run below was made on 2026-10-20 against the source in this repository
+as it is being published, with every hardening commit in it, except the run
+over the public internet, which keeps its 2026-09-15 date and says so. The
+single-host runs are of this tree directly. The two-machine runs were made
+from this repository's `make bundle` archive at `cc4fe27`, the commit before
+this section was rewritten (`unmoor-cc4fe27aead9.tar.gz`, SHA-256
+`30034b7a76053320e40862875e67dcd7503c8b368c886fd8c18349263472dada`; the only
+change since is this file), unpacked next to the lab harness, which is not
+part of this repository: both guests built that source and ran that binary,
+and each run is reported with the digest the two guests agreed on. The first
+attempt at the two-machine gate on this source stopped in the PMTU row's own
+probe plumbing, a timing race in the harness while the product was not
+running, and the gate was repeated unchanged after a lab reset; the figures
+below are from the complete second run.
 
 ### macOS — Darwin arm64, Apple clang 21.0.0 — 2026-10-20
 
@@ -311,12 +310,11 @@ with a further 49 bytes moving per build in the `LC_UUID` field and the ad-hoc
 code signature over it. Nothing in the source embeds a date, a git revision or
 a build identifier.
 
-### Impaired paths — two machines across a routed hop — 2026-09-15
+### Impaired paths — two machines across a routed hop — 2026-10-20
 
 The two-machine matrix over a routed, impaired path is this project's mandatory
-public-release gate. What follows is that gate run with the source in this
-repository as the product under test, at the 2026-09-15 publication; see the
-note at the top of this section for what has and has not been re-run since.
+public-release gate. What follows is that gate run on 2026-10-20 with the
+source in this repository as the product under test.
 
 Two Ubuntu 24.04 KVM guests (Linux 6.8.0-138, GCC 13.3.0) sit on separate
 bridges — `10.77.9.2/24` and `10.77.10.2/24`, `fd00:77:9::2` and
@@ -328,9 +326,9 @@ cannot also take away the ability to observe it.
 
 Both guests were synced from this repository's source and gated before
 anything ran: identical evidence-input stamp
-`69f5054938c7dd1cef8925a79acf3818a52116124dc5bbc3ae05f567e92b1153`, identical
-built binary
-`423a1a73297e74e910e0e298182800132076727a9f226d8cb71336a80f3dfa00`, and zero
+`f7337f28c24d7ecbc342ffff25c71e0a30c1261f3dd001e2137b63f955032515`, taken
+over the unpacked archive together with the harness, identical built binary
+`866efb1088f0ed4737a56889dd3cdbe217c70d19d9987ca0fa9a0b6513ba9dd9`, and zero
 test or fixture symbols in either. The sessions are the documented
 `bin/client.sh` path: real OpenSSH carrier, real UDP, real remote PTY.
 
@@ -346,31 +344,35 @@ test or fixture symbols in either. The sessions are the documented
 | stale return mapping — client source moved, return flows dropped | 30 |
 | bulk transfer — a bounded 100%-corruption interval, then asymmetric delay | 31 |
 | monitored listener — a bounded 100%-loss blackout, then `gap 5` reorder | 28 |
+| corrupted drain — exact-frame corruption while a blackout is repaired, then `corrupt 100%` on a probe | 45 |
+| routed capture — the listener's wire capture reconciled against its own counters | 41 |
 
-781 checks, no failures, and one recorded characterization — in the
-stale-return-mapping row, described below. Five rows are worth reading in
-detail: three for what the session holds together under, and two for what it
-does when the network does not come back.
+867 checks, no failures, and one recorded characterization — in the
+stale-return-mapping row, described below. Seven rows are worth reading in
+detail: three for what the session holds together under, two for what it
+does when the network does not come back, and two for what the wire says
+about what the endpoints claim.
 
 **Deep reorder.** Before the session runs, a calibration probe measures what
 the path actually does rather than what it was asked to do: 1200 datagrams
 sent, 1200 received, none lost, none duplicated, 1196 reorder events, and a
-maximum late displacement of 804 — a datagram arriving 804 positions after the
+maximum late displacement of 809 — a datagram arriving 809 positions after the
 one it was sent behind. `REPLAY_WINDOW` is 256 (`src/session.h`), so the path
 demonstrably moved packets further out of order than the window can absorb,
-and the router's own qdisc counters confirm it carried all 1203 datagrams and
+and the router's own qdisc counters confirm it carried all 1200 datagrams and
 dropped none. The terminal session then ran over that same path and printed
-4500 numbered lines. 4500 arrived. None was duplicated, none was missing, and
-there were zero inversions — over a transport that, by the kernel's own
-accounting, reordered 4234 packets on the production leg.
+23747 numbered lines. 23747 arrived. None was duplicated, none was missing,
+and there were zero inversions — over a transport that, by the kernel's own
+accounting, reordered 4056 packets on the production leg.
 
 **NAT rebind.** The router's SNAT mapping for the live session is moved from
 one port to another underneath it. Afterwards both ends are still the same
 processes with the same start times, the same UDP socket inodes and the same
-local ports; the listener recorded exactly two authenticated return-path
-adoptions across the whole run — the initial one, and the rebound tuple once —
-and each endpoint entered the established state exactly once. The session
-survived the rebind rather than re-establishing across it.
+local ports; 30 command datagrams and 14 freshly generated output datagrams
+crossed the rebound mapping; the listener recorded exactly two authenticated
+return-path adoptions across the whole run — the initial one, and the rebound
+tuple once — and each endpoint entered the established state exactly once.
+The session survived the rebind rather than re-establishing across it.
 
 **PMTU black hole.** This row characterizes a failure, not a success. A hop
 with a 200-byte MTU that discards oversized datagrams without sending ICMP
@@ -378,15 +380,20 @@ will break the session, and it does. What the scenario pins is *how*: the
 listener exits non-zero and names its undelivered byte count, the client exits
 non-zero and names the incomplete remote output, the END barrier is never
 falsely delivered, no authentication or replay diagnostic is produced, and
-every process and UDP socket on both sides is gone afterwards. Unmoor fails
-loudly on a dark path; it does not truncate silently and claim success.
+every process and UDP socket on both sides is gone afterwards. In this run
+the dark arm delivered 0 of 300 lines, and the router's frag-needed drop
+counter, which the probe before the session had advanced by 5, advanced by a
+further 37 for the session's own datagrams: the black hole acted on the
+product's traffic, not only on the probe's. The control arm beside it, with
+ICMP allowed, learned a 552-byte path MTU and delivered 300 of 300. Unmoor
+fails loudly on a dark path; it does not truncate silently and claim success.
 
 **Stale return mapping.** This is the recorded characterization, and it is the
 one in `SECURITY.md` under stale return-path mappings. The client is stopped,
 its effective IPv6 source is moved from `fd00:77:9::2` to `fd00:77:9::10`, both
 return ports are black-holed at the router, and the client is resumed. Input
-still executes at the far end — the router counted 68 and 63 authenticated
-datagrams arriving from the changed source — while 1406 return datagrams were
+still executes at the far end — the router counted 57 and 65 authenticated
+datagrams arriving from the changed source — while 332 return datagrams were
 discarded. The client reports `STALLED`, truthfully, and no black-holed output
 is ever shown as delivered. What it does **not** do is open a replacement
 source port and recover: that is the pinned characterization, `current terminal
@@ -396,7 +403,7 @@ works, and both ends exit 0.
 
 **Bulk transfer under corruption.** In the middle of a live 4 MiB push, the
 router is switched to `netem corrupt 100%` in both directions for a bounded
-interval — every packet crossing it gets a bit flipped. 596 A→B and 310 B→A
+interval — every packet crossing it gets a bit flipped. 653 A→B and 271 B→A
 datagrams went through while that was true. The push stayed active, the
 endpoint processes did not change, and **the destination file stayed absent
 for the whole corrupted interval**: no partial file is ever visible. After the
@@ -407,16 +414,47 @@ legs from both endpoints with no fatal protocol path on either.
 
 **Total-loss blackout.** Where the PMTU row is a path that never recovers,
 this one is a path that does. The router drops everything for a finite
-interval in the middle of a live terminal session — five authenticated client
-datagrams were dropped during it — and the terminal command that was lost is
+interval in the middle of a live terminal session — one authenticated client
+datagram was dropped during it — and the terminal command that was lost is
 executed after the blackout ends rather than being lost with it. The link is
-then switched to deterministic `gap 5` reordering and a 32 KiB payload is sent
-through it: all 32768 bytes arrived, and a byte-for-byte scan of the received
-buffer found nothing but the expected value. Ctrl-C returned control to the
-remote shell, and both the client and its driver exited 0 with no fatal
-diagnostic on either side.
+then switched to deterministic `gap 5` reordering, which carried 90 terminal
+datagrams, and a 32 KiB payload is sent through it: all 32768 bytes arrived,
+and a byte-for-byte scan of the received buffer found nothing but the
+expected value. Ctrl-C returned control to the remote shell, and both the
+client and its driver exited 0 with no fatal diagnostic on either side.
 
-### Random loss — 100 sessions across the same routed hop — 2026-09-15
+**Corrupted drain.** Two parts. First, a terminal session is draining a
+large output when the path is cut for a bounded interval; while the session
+repairs that loss, a relay in the path corrupts the first ciphertext byte of
+exactly four frames it is told to, drops nothing, and releases everything
+else it held. The repair engine made 402 retransmission attempts over a
+1676 ms drain window, 399 of them attributed to the cut and 3 to ordinary
+repair, and the terminal output was byte-exact afterwards, so the corrupted
+frames were refused and repaired like any other loss; every one of the
+row's 13 consistency gates on the run summary held. Second, what `netem
+corrupt 100%` actually does to a datagram stream: with it on the B→A
+direction, the router carried 300 probe datagrams, the guest kernel rejected
+293 of them before delivery — 284 UDP checksum errors and 9 IP header errors
+— and delivered 4 to the probe. netem flips a bit after the checksum is
+computed, so that is the kernel refusing corrupted datagrams, not Unmoor
+authenticating them, which is why the exact-frame corruption of the first
+part exists. With the corruption cleared, the same path delivered all 300
+datagrams once.
+
+**Routed capture.** The same kind of draining session, with the path cut for
+11.0 s in the middle of it, is captured on the listener's own network
+interface — not loopback — and the capture is reconciled against the
+listener's own counters. The capture holds 2104 packets, all UDP, with
+nothing dropped by the capturing kernel; the cut swallowed 389 return
+datagrams, 383,877 bytes, and the repair engine ran 396 times against it.
+The listener's counters say it transmitted 422 datagrams and 380,541 bytes on
+the wire; the capture says the same, 422 and 380,541, with zero residual, and
+a size histogram over 19 buckets and 414 captured data frames reconciles with
+no residual either. The reconciliation window covers the whole drain, and the
+terminal output was byte-exact afterwards. This is the row that says the
+counters quoted elsewhere in this section are what the wire saw.
+
+### Random loss — 100 sessions across the same routed hop — 2026-10-20
 
 The same two guests, same binary, same source stamp. Each row applies uniform
 random loss in both directions at the router and runs 20 full sessions,
@@ -424,25 +462,23 @@ bootstrap through post-quantum epoch-1 rekey to clean close.
 
 | Loss, both directions | PQ | Completed | Fatal | Timeout | Median rekey | p95 rekey |
 | --- | --- | --- | --- | --- | --- | --- |
-| 1% | require | 20/20 | 0 | 0 | 2 ms | 502 ms |
+| 1% | require | 20/20 | 0 | 0 | 1 ms | 2 ms |
 | 2% | require | 20/20 | 0 | 0 | 1 ms | 2 ms |
-| 5% | require | 20/20 | 0 | 0 | 2 ms | 502 ms |
-| 10% | require | 19/20 | 0 | 0 | 1 ms | 1502 ms |
+| 5% | require | 20/20 | 0 | 0 | 1 ms | 501 ms |
+| 10% | require | 20/20 | 0 | 0 | 2 ms | 503 ms |
 | 5% | off | 20/20 | 0 | 0 | — | — |
 
-No attempt in any row ended in a protocol-fatal close or a timeout. The single
-non-completion, at 10% loss, is counted as a failure because the harness
-counted it as one: that session completed its rekey, opened its PTY, printed
-its marker and closed with status 0, but a diagnostic line was interleaved
-into the marker line in the capture, so the row's exact-line oracle did not
-match it.
+All 100 sessions completed; none ended in a protocol-fatal close or a
+timeout. The 2026-09-15 run had counted one session at 10% loss as a
+non-completion because a diagnostic line was interleaved into its marker
+line; this run had none.
 
 The rekey columns are the epoch-1 post-quantum rekey, which is why the
-`--pq=off` row has none to report. The 502 ms and 1502 ms tails are not
+`--pq=off` row has none to report. The 501 ms and 503 ms tails are not
 computation — `PQ_REKEY_RETRY_MS` is 500 (`src/pq_rekey.h`), so those are one
-and three retransmission timers firing while a lost rekey fragment waits. The
-median stays at 1–2 ms at every loss level. Across the 1% row the endpoints
-retransmitted 368 fragments in total, and across the 10% row, 352.
+retransmission timer firing while a lost rekey fragment waits. The median
+stays at 1–2 ms at every loss level. Across the 1% row the endpoints
+retransmitted 341 fragments in total, and across the 10% row, 406.
 
 ### Scope
 
