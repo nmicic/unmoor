@@ -281,7 +281,9 @@ static void test_group2_frames(void)
 
     /* 2-06: ordinary terminal datagram and its plaintext budget */
     CHECK("2-06 terminal_datagram_1200_plaintext_1172",
-          FRAME_DEFAULT_DGRAM == 1200 && MAX_PT_DEFAULT == 1172);
+          FRAME_DEFAULT_DGRAM == 1200 && MAX_PT_DEFAULT == 1172 &&
+          MAX_PT_DEFAULT ==
+              FRAME_DEFAULT_DGRAM - FRAME_HEADER_LEN - FRAME_TAG_LEN);
 
     /* 2-07: absolute plaintext ceiling at FRAME_MAX_LEN */
     CHECK("2-07 ceiling_is_the_terminal_datagram",
@@ -1505,18 +1507,29 @@ static void test_group8_negotiation(void)
               negotiation_decode(plain, sizeof(plain), 0, &msg) == ERR_VERSION);
     }
 
-    /* A previous protocol version is incompatible in either direction. */
+    /* A previous protocol version is refused on the version byte alone, in
+     * both directions and whatever it claims to support, rather than
+     * negotiated down to. The grammar below it is otherwise well formed. */
     {
         uint8_t plain[NEGOTIATION_PLAIN_LEN];
         negotiation_message_t msg;
+        uint16_t hello_rc, ack_rc, legacy_rc;
+
         negotiation_encode_hello(plain, na,
                                  UNMOOR_CAP_DEFAULT_SUPPORTED,
                                  UNMOOR_CAP_DEFAULT_REQUIRED);
         plain[0] = (uint8_t)(NEGOTIATION_HELLO_VERSION - 1U);
-        uint16_t hello_rc = negotiation_decode(plain, sizeof(plain), 0, &msg);
-        uint16_t ack_rc = negotiation_decode(plain, sizeof(plain), 1, &msg);
-        CHECK("8-05a previous_wire_version_is_incompatible",
-              hello_rc == ERR_VERSION && ack_rc == ERR_VERSION);
+        hello_rc = negotiation_decode(plain, sizeof(plain), 0, &msg);
+        ack_rc = negotiation_decode(plain, sizeof(plain), 1, &msg);
+        negotiation_encode_legacy(plain, na, 0x01);
+        plain[0] = (uint8_t)(NEGOTIATION_HELLO_VERSION - 1U);
+        legacy_rc = negotiation_decode(plain, sizeof(plain), 0, &msg);
+        CHECK("8-05a previous_wire_version_is_refused_both_directions",
+              NEGOTIATION_HELLO_VERSION == 0x03U &&
+              hello_rc == ERR_VERSION && ack_rc == ERR_VERSION &&
+              legacy_rc == ERR_VERSION &&
+              msg.kind == NEGOTIATION_INVALID &&
+              msg.supported_caps == 0U && msg.required_caps == 0U);
     }
 
     /* 8-06..08: redundant low bits, required subset, and HELLO status are
@@ -1991,7 +2004,7 @@ static void test_group8_negotiation(void)
         negotiation_encode_hello(hello, na, hybrid, base);
         rc = negotiation_decode(hello, sizeof(hello), 0, &msg);
         rc |= negotiation_select(&msg, base, base, &selected);
-        CHECK("8-50 prefer_intersects_unoffered_d45_to_classical_bundle",
+        CHECK("8-50 prefer_intersects_unoffered_d45_to_exact_classical_bundle",
               rc == 0 && selected == base);
 
         negotiation_encode_hello(hello, na, hybrid, hybrid);
