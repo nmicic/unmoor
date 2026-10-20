@@ -174,22 +174,27 @@ socket names — is what was cleaned, because that is what a user reads.
 
 ## How that was verified
 
-Each of the 134 non-vendor C source files here was compared with its
-counterpart in the development tree under two normalizations: every comment
+Each of the 135 non-vendor C source files here was compared with its
+counterpart in the development tree under three normalizations: every comment
 replaced by a single space, using a scanner that respects string and character
-literals so a `/*` inside a string is not mistaken for a comment, and then
-trailing whitespace stripped from each line.
+literals so a `/*` inside a string is not mistaken for a comment; trailing
+whitespace stripped from each line; and blank lines dropped.
 
-Both normalizations matter, and the second is not cosmetic bookkeeping. Where
-the scrub deleted a comment that sat at the end of a line of code, it took the
-spaces in front of it too. Without the second normalization the comparison
-reports files differing that differ in nothing but invisible bytes.
+All three matter, and the last two are not cosmetic bookkeeping. Where the
+scrub deleted a comment that sat at the end of a line of code, it took the
+spaces in front of it too, and where it deleted a comment that filled whole
+lines, it left empty lines behind. Without the second and third normalizations
+the comparison reports files differing that differ in nothing but invisible
+bytes.
 
-With both applied, **128 of the 134 files are identical to the development
-tree**, and the six that differ are `src/bulk.c`, `src/child_transfer.c`,
-`src/main.c`, `src/monitor_startup.c`, `src/session.c` and
-`tools/frame_test.c` — differing in exactly the places listed above and
-nowhere else. The diff was read line by line, not summarized by a count.
+With all three applied, **129 of the 135 files are identical to the
+development tree**, and the six that differ are `src/bulk.c`,
+`src/child_transfer.c`, `src/main.c`, `src/monitor_startup.c`, `src/session.c`
+and `tools/frame_test.c` — differing in exactly the places listed above and
+nowhere else, apart from two statements in `src/session.c` that are wrapped
+across lines differently and are otherwise identical. The diff was read line
+by line, not summarized by a count, and the count was taken again on
+2026-10-20, after the hardening commits.
 
 `src/vendor/` was compared directly. Every upstream source file is identical.
 One file was added on the way out: `src/vendor/monocypher-LICENCE.md`, because
@@ -224,27 +229,54 @@ downloads it.
 
 ## Verification run
 
-Everything below was run against the source in this repository as it stood at
-the publication of 2026-09-15 — not against the development tree, and not
-against an earlier draft. The hardening commits made since then have been built
-and checked on macOS and on Linux, but had not been through the two-machine
-gate when this paragraph was written; this section is refreshed when they have.
-Where a run used two machines, both built from the same `make bundle` archive
-of this tree, and the run is reported with the digest they agreed on.
+The single-host runs below were made on 2026-10-20 against the source in this
+repository as it is being published, with every hardening commit in it. The
+two-machine runs are from the publication of 2026-09-15 and were made against
+the source as it stood then — not against the development tree, and not
+against an earlier draft. They have not been repeated with the current source
+as the product under test, and they keep their date. What has been through the
+two-machine gate since is the development tree carrying the same hardening
+changes: on 2026-10-20 its routed two-guest matrix and its loss matrix passed
+on the commit that ports them. That is evidence about the development tree and
+is reported here as that, not as a run of this repository's source; the dated
+sections are refreshed when they have been re-run. Where a run used two
+machines, both built from the same `make bundle` archive of this tree, and the
+run is reported with the digest they agreed on.
 
-### macOS — Darwin arm64, Apple clang 21.0.0 — 2026-09-15
+### macOS — Darwin arm64, Apple clang 21.0.0 — 2026-10-20
 
-- `make` from clean: zero warnings at `-Wall -Wextra -Wsign-compare -Wformat=2`.
-- `make test`: 136 checks pass — 117 frame, reassembly and negotiation checks,
-  and `pq_crypto_test: 19 PASS, 0 FAIL`.
+- `make` from clean: zero warnings at `-Wall -Wextra -Wsign-compare -Wformat=2`,
+  with `-fstack-protector-strong` and zero-initialized automatic variables
+  (`-ftrivial-auto-var-init=zero`, which the Makefile adds where the compiler
+  accepts it).
+- `make test`: 154 checks pass — 118 frame, reassembly and negotiation checks,
+  `pq_crypto_test: 19 PASS, 0 FAIL`, and `session_key_gate_test: 17/17
+  passed`.
 - `make hygiene`: production symbol and fixture hygiene passes with zero
   matches, using the generalized patterns described above.
 - `make shell-syntax`: passes.
 - `make smoke`: passes — client launcher, real post-quantum public bootstrap,
   loopback UDP session, exact remote PTY output, clean owned shutdown. No host
   was contacted.
+- `make analyze`: the clang static analyzer over the 66 source files in `src/`
+  reports nothing.
+
+### Linux — Ubuntu 24.04, x86-64, GCC 13.3.0 — 2026-10-20
+
+The `make bundle` archive of this tree, unpacked and built on an Ubuntu 24.04
+host (kernel 6.8.0-124).
+
+- `make` from clean: zero warnings, with `_FORTIFY_SOURCE=3`, PIE, stack-clash
+  and control-flow protection and zero-initialized automatic variables, which
+  the Makefile selects on Linux.
+- `make check`: passes — the same 154 checks, symbol hygiene with zero
+  matches, shell syntax.
 
 ### Two hosts, real network — 2026-09-15
+
+This run is from the 2026-09-15 publication and has not been repeated since
+the hardening commits; the digest below is that build's, not the current
+source's.
 
 Two Ubuntu 24.04 machines, x86-64, GCC 13.3.0, kernels 6.8.0-124 and
 6.8.0-136, at different places on the public internet. Each unpacked the same
@@ -279,7 +311,8 @@ a build identifier.
 
 The two-machine matrix over a routed, impaired path is this project's mandatory
 public-release gate. What follows is that gate run with the source in this
-repository as the product under test.
+repository as the product under test, at the 2026-09-15 publication; see the
+note at the top of this section for what has and has not been re-run since.
 
 Two Ubuntu 24.04 KVM guests (Linux 6.8.0-138, GCC 13.3.0) sit on separate
 bridges — `10.77.9.2/24` and `10.77.10.2/24`, `fd00:77:9::2` and
