@@ -758,27 +758,43 @@ static int open_listener_log(const char *log_path)
         errno = EINVAL;
         return -1;
     }
+    /* O_NONBLOCK keeps a FIFO without a reader from parking the open; a
+     * regular file ignores the flag, so it is not cleared afterwards. */
     logfd = open(log_path,
-                 O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC | O_NOFOLLOW,
+                 O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC | O_NOFOLLOW |
+                     O_NONBLOCK,
                  0600);
-    if (logfd < 0)
+    if (logfd < 0) {
+        int cause = errno;
+        fprintf(stderr, "unmoor: deaddrop log %s refused: %s\n", log_path,
+                strerror(cause));
+        errno = cause;
         return -1;
+    }
     /* O_NOFOLLOW covers only the final component. A FIFO, a device or
      * another user's file planted at the path is not a log of ours. */
     if (fstat(logfd, &state) != 0) {
         int cause = errno;
         (void)close(logfd);
+        fprintf(stderr, "unmoor: deaddrop log %s refused: %s\n", log_path,
+                strerror(cause));
         errno = cause;
         return -1;
     }
     if (!S_ISREG(state.st_mode) || state.st_uid != geteuid()) {
         (void)close(logfd);
+        fprintf(stderr,
+                "unmoor: deaddrop log %s refused: not a regular file owned "
+                "by this user\n",
+                log_path);
         errno = EPERM;
         return -1;
     }
     if (fchmod(logfd, 0600) != 0) {
         int cause = errno;
         (void)close(logfd);
+        fprintf(stderr, "unmoor: deaddrop log %s refused: %s\n", log_path,
+                strerror(cause));
         errno = cause;
         return -1;
     }
@@ -2094,6 +2110,12 @@ static int d28_runtime_listen_monitored(
     attempt_owned = 0;
 
 done:
+    if (!success) {
+        int cause = errno;
+        fprintf(stderr,
+                "unmoor: deaddrop monitored listener did not start%s%s\n",
+                cause ? ": " : "", cause ? strerror(cause) : "");
+    }
     if (!success && custodian > 0)
         (void)terminate_and_reap(custodian);
     runtime_child_pid = 0;

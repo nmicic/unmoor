@@ -146,10 +146,14 @@ already buys.
   UDP listener binds its port exclusively, so a second process cannot share
   the socket and take datagrams; a port that is already taken is a loud
   failure. The `--listener-monitor` rendezvous between the monitor and its
-  listener child uses a predictable abstract Unix socket name that any local
-  user can bind first; the start then fails with a clear error and does not
-  retry. A Unix-socket transport accepts connections only from the same user,
-  and the listener's `--log` file must be a regular file that user owns.
+  listener child is an abstract Unix socket under a random name. Abstract
+  sockets carry no permissions, and once the monitor has bound the name it
+  is visible to every user in the network namespace through
+  `/proc/net/unix`; a local user who connects before the child does is
+  rejected by the peer identity check, and the start then fails with a
+  message and does not retry. A Unix-socket transport accepts connections
+  only from the same user, and the listener's `--log` file must be a regular
+  file that user owns.
 - **Backlog is bounded per sender, not globally.** Classic terminal state sync
   holds up to 256 MiB of transmit history and 4 MiB of receive-pending data per
   endpoint by default. Channelised exact streams default to 16 MiB/1 MiB per

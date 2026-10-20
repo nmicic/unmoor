@@ -582,7 +582,7 @@ recommended `bin/client.sh` accepts the corresponding bootstrap-helper forms.
 | `--deaddrop-parent DIR` | Mode-0700 parent for one-shot public exchange records. |
 | `--bind-host HOST` | Direct deaddrop-listener bind address. The wrapper-facing spelling is `--remote-bind-host`. |
 | `--bootstrap-foreground` | Remote listener waits for its owned listener child; normally managed by the wrapper. |
-| `--log PATH` | Listener-side diagnostics file for `--deaddrop-bootstrap` and the one-shot bulk server; `UNMOOR_DEADDROP_LOG` is the environment form. The path must be a regular file owned by the user, or not exist yet. |
+| `--log PATH` | Listener-side diagnostics file for `--deaddrop-bootstrap` and the one-shot bulk server; `UNMOOR_DEADDROP_LOG` is the environment form. The path must be a regular file owned by the user, or not exist yet; a symlink, FIFO, device or another user's file is refused with a message naming the path. |
 | `--listener-monitor` | Experimental Linux x86-64/aarch64 classic-terminal isolation boundary. An explicit unsupported request fails; it never silently falls back. |
 
 For `bin/client.sh`, `--local PATH` deliberately selects another local binary;
