@@ -203,9 +203,11 @@ tree did not actually carry. It is the complete, byte-identical `LICENCE.md`
 from the pinned Monocypher 4.0.3 upstream archive, not a reconstructed extract
 from one source-file header.
 
-All 150 non-vendor source, script, documentation and build files — everything
+All 152 non-vendor source, script, documentation and build files — everything
 except `LICENSE` and `.gitignore` — were checked for the copyright line and
-the SPDX identifier; none were missing.
+the SPDX identifier; none were missing. The count was 150 at the first
+publication and was taken again on 2026-10-20, after `.github/dependabot.yml`
+and `tools/session_key_gate_test.c` were added.
 
 ### What was written for this repository rather than copied
 
@@ -239,9 +241,11 @@ two-machine gate since is the development tree carrying the same hardening
 changes: on 2026-10-20 its routed two-guest matrix and its loss matrix passed
 on the commit that ports them. That is evidence about the development tree and
 is reported here as that, not as a run of this repository's source; the dated
-sections are refreshed when they have been re-run. Where a run used two
-machines, both built from the same `make bundle` archive of this tree, and the
-run is reported with the digest they agreed on.
+sections are refreshed when they have been re-run. The two-machine runs of
+2026-09-15 were made on both machines from the same `make bundle` archive of
+this repository's source as it stood then, and each is reported with the
+digest the two machines agreed on. The 2026-10-20 run of the development tree
+is not a run of such an archive and reports no digest here.
 
 ### macOS — Darwin arm64, Apple clang 21.0.0 — 2026-10-20
 
