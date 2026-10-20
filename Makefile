@@ -24,7 +24,11 @@ override CFLAGS += -Wsign-compare -Wformat=2 -fstack-protector-strong \
     $(call probe-c-flag,$(CC),-ftrivial-auto-var-init=zero)
 ifeq ($(PLATFORM),Linux)
   # Level 3 where the toolchain has it; older glibc headers fall back to 2.
-  DEFS += -D_FORTIFY_SOURCE=3
+  # A sanitizer build leaves it out so the sanitizer, not glibc's check,
+  # is what reports an overflow.
+  ifeq ($(findstring -fsanitize,$(CFLAGS)),)
+    DEFS += -D_FORTIFY_SOURCE=3
+  endif
   override CFLAGS += -fPIE $(call probe-c-flag,$(CC),-fstack-clash-protection)
   override LDFLAGS += -pie -Wl,-z,relro,-z,now -Wl,-z,noexecstack
   override LDLIBS += -lutil
